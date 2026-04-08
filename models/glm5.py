@@ -4,10 +4,11 @@ from .base import ModelQuantConfig
 Glm5Config = ModelQuantConfig(
     model_id="zai-org/GLM-5",
     trust_remote_code=True,
-    streaming=False,
+    streaming=True,
     extra_quant_overrides={
         "*indexer*": {"enable": False},
     },
+    extra_mtp_prefixes=["model.layers.78."],
 )
 
 

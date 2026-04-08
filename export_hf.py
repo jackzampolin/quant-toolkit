@@ -211,6 +211,7 @@ def export_hf(
     export_dir: str | Path,
     dtype: torch.dtype | None = None,
     prepare_fn: Any | None = None,
+    extra_mtp_prefixes: list[str] | None = None,
 ) -> None:
     """Export a quantized HF model to safetensors, streaming one layer at a time.
 
@@ -333,6 +334,7 @@ def export_hf(
     # Merge MTP (multi-token prediction) weights from source checkpoint if present.
     shard_idx, total_tensors = _merge_mtp_weights(
         model, export_dir, weight_map, shard_idx, total_tensors,
+        extra_prefixes=extra_mtp_prefixes or [],
     )
 
     # Postprocess: filter quantizer metadata keys and rename kv cache scales.
@@ -355,8 +357,14 @@ def _merge_mtp_weights(
     weight_map: dict[str, str],
     shard_idx: int,
     total_tensors: int,
+    extra_prefixes: list[str] | None = None,
 ) -> tuple[int, int]:
-    """Copy MTP weights unquantized from the source checkpoint into our export."""
+    """Copy MTP weights unquantized from the source checkpoint into our export.
+
+    Keys starting with "mtp." are always included. Additional prefixes can be
+    supplied via extra_prefixes for models that store MTP weights elsewhere
+    (e.g. GLM-5 uses model.layers.78. for its next-token prediction head).
+    """
     from safetensors.torch import load_file
 
     name_or_path = model.config._name_or_path
@@ -377,7 +385,10 @@ def _merge_mtp_weights(
     with open(src_index_path) as f:
         src_wm = json.load(f)["weight_map"]
 
-    mtp_keys = [k for k in src_wm if k.startswith("mtp.")]
+    all_prefixes = ["mtp."] + (extra_prefixes or [])
+    mtp_keys = [k for k in src_wm if any(k.startswith(p) for p in all_prefixes)]
+    # Don't re-merge keys already exported by the main loop.
+    mtp_keys = [k for k in mtp_keys if k not in weight_map]
     if not mtp_keys:
         print("  No MTP keys in source checkpoint, skipping.")
         return shard_idx, total_tensors

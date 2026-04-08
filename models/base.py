@@ -18,6 +18,7 @@ class ModelQuantConfig:
     trust_remote_code: bool = False
     streaming: bool = False
     extra_quant_overrides: dict = field(default_factory=dict)
+    extra_mtp_prefixes: list = field(default_factory=list)
 
     def get_model_cls(self):
         """Return explicit model class, or None for AutoModelForCausalLM."""

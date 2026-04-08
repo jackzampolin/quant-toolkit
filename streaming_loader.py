@@ -200,7 +200,7 @@ class StreamingModelLoader:
         storage_map = {}
         # Reserve headroom per storage GPU for CUDA context, driver memory,
         # and PyTorch allocator fragmentation from loading many small tensors.
-        gpu_headroom = 4.0 * 1024**3
+        gpu_headroom = 0
         gpu_capacity = self.gpu_capacity_gib * 1024**3 - gpu_headroom
         cpu_capacity = self.cpu_capacity_gib * 1024**3
 
