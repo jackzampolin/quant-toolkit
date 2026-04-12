@@ -1,0 +1,6 @@
+# Calibration datasets for MiniMax M2.7.
+
+[[dataset]]
+path = "text/agentic_coding_calib_generic.jsonl"
+max_len = 1024
+

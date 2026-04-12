@@ -325,6 +325,7 @@ torch.cuda.reset_peak_memory_stats()
 # ---------------------------------------------------------------------------
 
 amax_ckpt_path = os.path.join(args.export_dir, "amax_checkpoint.safetensors")
+quantile_ckpt_path = os.path.join(args.export_dir, "quantile_checkpoint.json")
 os.makedirs(args.export_dir, exist_ok=True)
 
 
@@ -339,6 +340,12 @@ def _save_amax_checkpoint(m, batch_num):
                 amaxes[name] = v.reshape(1) if v.dim() == 0 else v
     save_file(amaxes, amax_ckpt_path)
     print(f"    [checkpoint] {len(amaxes)} amaxes saved after batch {batch_num}")
+
+
+def _save_quantile_checkpoint(m, batch_num):
+    from modelopt.torch.quantization.calib.quantile import save_quantile_data
+    n_saved = save_quantile_data(m, quantile_ckpt_path)
+    print(f"    [checkpoint] {n_saved} quantile estimates saved after batch {batch_num}")
 
 
 def _restore_amax(m, path):
@@ -359,9 +366,27 @@ def _restore_amax(m, path):
     print(f"Restored {restored}/{len(saved)} calibrator amaxes from {path}")
 
 
+def _override_quantile_levels(m):
+    """Override quantile levels on all QuantileCalibrators if specified in config."""
+    if not hasattr(args, "quantiles"):
+        return
+    from modelopt.torch.quantization.calib.quantile import QuantileCalibrator, P2QuantileEstimator
+    count = 0
+    for name, mod in m.named_modules():
+        cal = getattr(mod, "_calibrator", None)
+        if isinstance(cal, QuantileCalibrator):
+            cal._quantile_probs = list(args.quantiles)
+            cal._estimators = {p: P2QuantileEstimator(p) for p in cal._quantile_probs}
+            count += 1
+    if count:
+        print(f"  Overrode quantile levels to {args.quantiles} on {count} calibrators")
+
+
 def forward_loop(m):
     input_device = next(m.parameters()).device
     resume = args.resume_batch
+
+    _override_quantile_levels(m)
 
     if args.resume_amax:
         _restore_amax(m, args.resume_amax)
@@ -388,6 +413,8 @@ def forward_loop(m):
         gc.collect()
         torch.cuda.empty_cache()
         _save_amax_checkpoint(m, i)
+        if args.calib_method == "quantile":
+            _save_quantile_checkpoint(m, i)
     print("Calibration complete.")
 
 
@@ -401,10 +428,7 @@ for pattern, override in cfg.get_all_quant_overrides().items():
 
 if args.calib_method == "quantile":
     qcfg["algorithm"] = "quantile"
-    calib_cfg = {"type": "quantile"}
-    if hasattr(args, "quantiles"):
-        calib_cfg["quantiles"] = args.quantiles
-    qcfg["quant_cfg"]["*input_quantizer"]["calibrator"] = calib_cfg
+    qcfg["quant_cfg"]["*input_quantizer"]["calibrator"] = "quantile"
 
 print(f"\nQuantizing with NVFP4 (model={args.model}, calib={args.calib_method})...")
 model = mtq.quantize(model, qcfg, forward_loop)

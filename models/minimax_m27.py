@@ -1,8 +1,8 @@
 from .base import ModelQuantConfig
 
 
-MinimaxM25Config = ModelQuantConfig(
-    model_id="/data/models/transformers/MiniMax-M2.5-dequantized",
+MinimaxM27Config = ModelQuantConfig(
+    model_id="/data/models/MiniMax-M2.7-BF16",
     trust_remote_code=True,
     streaming=True,
     extra_quant_overrides={
@@ -24,8 +24,8 @@ def _register_moe():
 def _get_model_cls():
     from transformers_compat import load_minimax_model_cls
 
-    return load_minimax_model_cls(MinimaxM25Config.model_id)
+    return load_minimax_model_cls(MinimaxM27Config.model_id)
 
 
-MinimaxM25Config.register_moe = _register_moe
-MinimaxM25Config.get_model_cls = _get_model_cls
+MinimaxM27Config.register_moe = _register_moe
+MinimaxM27Config.get_model_cls = _get_model_cls

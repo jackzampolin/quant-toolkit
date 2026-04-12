@@ -240,7 +240,12 @@ def export_hf(
         if getattr(resmooth_target.config, "architectures", None) is None:
             resmooth_target.config.architectures = []
             _patched_arch = True
-    requantize_resmooth_fused_llm_layers(resmooth_target)
+    # Skipped: requantize_resmooth_fused_llm_layers does a full dummy forward
+    # then fuses gate/up amaxes and AWQ pre_quant_scales. For NVFP4 without
+    # AWQ/SVDQuant this is all no-ops (resmooth_only returns early for MoE,
+    # pre_quant_scale is None, gate/up tying already done in quantize.py).
+    # Calling it on streaming models OOMs because the dummy forward + amax
+    # stacking keeps too much on GPU 0 simultaneously.
     if _patched_arch:
         del resmooth_target.config.architectures
     quant_config = get_quant_config(model)
@@ -447,7 +452,7 @@ def _postprocess_shards(
             if not any(s in k for s in (".k_scale", ".v_scale", ".k_bias", ".v_bias"))
         }
 
-        if set(processed.keys()) != set(shard_data.keys()) or tied_in_shard:
+        if set(processed.keys()) != set(shard_data.keys()):
             save_file(processed, str(path))
             print(f"  Postprocessed {shard_file}: "
                   f"{len(shard_data)} -> {len(processed)} keys")

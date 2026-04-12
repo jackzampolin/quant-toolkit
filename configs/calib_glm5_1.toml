@@ -1,16 +1,20 @@
 # Calibration datasets for GLM-5.1.
 
-[[dataset]]
-path = "text/agentic_coding_calib_v3.jsonl"
-max_len = 1024
-limit = 8192
+[calibration]
+method = "quantile"
+quantiles = [0.99, 0.999, 0.9999, 0.99999]
+
+#[[dataset]]
+#path = "text/agentic_coding_calib_v3.jsonl"
+#max_len = 1024
+#limit = 8192
 
 [[dataset]]
 path = "text/diverse_calib.jsonl"
 max_len = 1024
-limit = 2048
+limit = 4096
 
 [[dataset]]
 path = "text/deep_calib.jsonl"
 max_len = 8192
-limit = 512
+limit = 256
