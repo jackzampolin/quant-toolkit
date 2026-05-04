@@ -36,6 +36,7 @@ from modelopt.torch.export.unified_export_hf import (
 
 MAX_SHARD_SIZE = 5 * 1024**3  # 5 GB per shard.
 SCALE_SHARD_NAME = "model-inputscales.safetensors"
+MTP_SHARD_NAME = "model-mtp.safetensors"
 
 _EXPERT_PROJ_RE = re.compile(
     r"^(.*\.experts)\.(gate_proj|up_proj|down_proj)\.(\d+)\.(.+)$"
@@ -212,6 +213,7 @@ def export_hf(
     dtype: torch.dtype | None = None,
     prepare_fn: Any | None = None,
     extra_mtp_prefixes: list[str] | None = None,
+    preserve_remote_code: bool = False,
 ) -> None:
     """Export a quantized HF model to safetensors, streaming one layer at a time.
 
@@ -351,7 +353,7 @@ def export_hf(
     _rename_shards(export_dir, weight_map, total_shards)
 
     # --- Save config, tokenizer, and quant metadata ---
-    _save_model_metadata(model, export_dir, hf_quant_config)
+    _save_model_metadata(model, export_dir, hf_quant_config, preserve_remote_code=preserve_remote_code)
 
     print(f"Export complete. Saved to: {export_dir}")
 
@@ -470,9 +472,13 @@ def _rename_shards(
     total_shards: int,
 ) -> None:
     """Rename shards to the standard HF format: model-00001-of-NNNNN.safetensors."""
+    del total_shards
     old_names = sorted(
-        name for name in set(weight_map.values()) if name != SCALE_SHARD_NAME
+        name
+        for name in set(weight_map.values())
+        if name not in {SCALE_SHARD_NAME, MTP_SHARD_NAME}
     )
+    total_shards = len(old_names)
     rename_map: dict[str, str] = {}
 
     for i, old_name in enumerate(old_names, 1):
@@ -505,15 +511,17 @@ def _save_model_metadata(
     model: nn.Module,
     export_dir: Path,
     hf_quant_config: dict | None,
+    preserve_remote_code: bool = False,
 ) -> None:
     """Save config.json (with quantization_config), generation_config, and tokenizer files."""
     # Save config.json from the model's config object.
     config = model.config
     config_dict = config.to_dict()
 
-    # Strip auto_map so the exported model doesn't require trust_remote_code
-    # when the model class is already in upstream transformers.
-    config_dict.pop("auto_map", None)
+    # Strip auto_map for models already in upstream transformers. Remote-code
+    # models such as MiMo need these entries plus the copied Python files.
+    if not preserve_remote_code:
+        config_dict.pop("auto_map", None)
 
     # Ensure architectures is set. Nested text_config may have None; derive
     # from the outer model class (e.g. Qwen3_5MoeForConditionalGeneration).
@@ -544,10 +552,13 @@ def _save_model_metadata(
         source_dir = Path(name_or_path)
     else:
         from huggingface_hub import snapshot_download
+        allow_patterns = ["*.json", "*.jinja", "*.txt", "*.model"]
+        if preserve_remote_code:
+            allow_patterns.extend(["*.py", "audio_tokenizer/*"])
         source_dir = Path(snapshot_download(
             name_or_path,
-            allow_patterns=["*.json", "*.jinja", "*.txt", "*.model"],
-            ignore_patterns=["*.safetensors"],
+            allow_patterns=allow_patterns,
+            ignore_patterns=None if preserve_remote_code else ["*.safetensors"],
             local_files_only=True,
         ))
     copy_patterns = [
@@ -556,11 +567,25 @@ def _save_model_metadata(
         "preprocessor_config.json", "video_preprocessor_config.json",
         "merges.txt", "vocab.json",
     ]
+    if preserve_remote_code:
+        copy_patterns.extend([
+            "configuration_mimo_v2.py", "modeling_mimo_v2.py",
+        ])
     copied = []
     for name in copy_patterns:
         src = source_dir / name
         if src.exists():
             shutil.copy2(src, export_dir / name)
             copied.append(name)
+
+    if preserve_remote_code:
+        for dirname in ("audio_tokenizer",):
+            src = source_dir / dirname
+            if src.exists():
+                dst = export_dir / dirname
+                if dst.exists():
+                    shutil.rmtree(dst)
+                shutil.copytree(src, dst)
+                copied.append(dirname)
 
     print(f"  Wrote config.json, generation_config.json, and copied: {', '.join(copied)}")

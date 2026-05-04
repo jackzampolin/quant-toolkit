@@ -1,0 +1,36 @@
+# Calibration datasets for MiMo-V2.5.
+
+[[dataset]]
+path = "text/agentic_coding_calib_v3.jsonl"
+max_len = 1024
+limit = 4096
+
+[[dataset]]
+path = "multimodal/vqa_calib.jsonl"
+batch_size = 32
+limit = 2048
+multimodal = true
+
+# Audio calibration requires a local JSONL manifest with file paths.
+# [[dataset]]
+# path = "multimodal/mimo_audio_calib.jsonl"
+# batch_size = 16
+# multimodal = true
+# limit = 256
+
+[[dataset]]
+path = "/data/datasets/multimodal/video/finevideo_calib.jsonl"
+batch_size = 8
+limit = 256
+multimodal = true
+
+[[dataset]]
+path = "text/diverse_calib.jsonl"
+max_len = 1024
+limit = 1024
+
+[[dataset]]
+path = "text/deep_calib.jsonl"
+batch_size = 6
+max_len = 8192
+limit = 1024

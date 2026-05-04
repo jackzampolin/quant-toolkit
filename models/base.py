@@ -1,5 +1,4 @@
 from dataclasses import dataclass, field
-from typing import Callable
 
 
 # Shared quant overrides: disable attention weights/inputs, keep FP8 KV cache.
@@ -19,6 +18,7 @@ class ModelQuantConfig:
     streaming: bool = False
     extra_quant_overrides: dict = field(default_factory=dict)
     extra_mtp_prefixes: list = field(default_factory=list)
+    preserve_remote_code: bool = False
 
     def get_model_cls(self):
         """Return explicit model class, or None for AutoModelForCausalLM."""

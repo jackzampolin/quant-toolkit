@@ -4,8 +4,10 @@ import gc
 import json
 import os
 import re
+import sys
 import tomllib
 from collections import defaultdict
+from pathlib import Path
 
 import torch
 from torch import nn
@@ -15,6 +17,23 @@ import modelopt.torch.quantization as mtq
 import logging
 
 from models import load_config, AVAILABLE_MODELS
+from models.mimo_v25_visual import (
+    build_mimo_processor,
+    precompute_mimo_visual_embeds_for_batches,
+    replace_mimo_image_pixels,
+)
+from models.mimo_v25_media import (
+    audio_codes_from_mels,
+    audio_placeholder_count_from_codes,
+    ensure_mimo_audio_tokenizer,
+    expand_audio_placeholders,
+    load_audio_mel,
+    mimo_video_processor_kwargs,
+    normalize_processor_inputs,
+    pad_audio_codes_to_group_boundary,
+    video_audio_source,
+    video_uses_audio,
+)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -36,7 +55,7 @@ parser.add_argument("--calib-jsonl", default=None,
 parser.add_argument("--calib-limit", type=int, default=192)
 parser.add_argument("--batch-size", type=int, default=48)
 parser.add_argument("--batch-tokens", type=int, default=128 * 1024,
-                    help="Token budget for auto-computing batch_size per dataset (batch_size = batch_tokens // max_len).")
+                    help="Token budget for auto-computing batch_size when a dataset sets max_len.")
 parser.add_argument("--max-len", type=int, default=4096)
 parser.add_argument("--cpu-capacity", type=str, default="200GiB")
 parser.add_argument("--save-amax", type=str, default=None,
@@ -63,7 +82,7 @@ args = parser.parse_args()
 # ---------------------------------------------------------------------------
 
 def load_calib_datasets(args):
-    """Return list of dicts with keys: path, limit, batch_size, max_len.
+    """Return list of dicts with keys: path, limit, batch_size, optional max_len.
 
     Also applies [calibration] overrides from the TOML to args if present.
     """
@@ -79,9 +98,11 @@ def load_calib_datasets(args):
                 parser.error(f"dataset[{i}] missing 'path' in {args.calib_config}")
             if not os.path.isabs(ds["path"]):
                 ds["path"] = os.path.join(args.data_dir, ds["path"])
-            ds.setdefault("max_len", 4096)
             if "batch_size" not in ds:
-                ds["batch_size"] = max(1, batch_tokens // ds["max_len"])
+                if "max_len" in ds:
+                    ds["batch_size"] = max(1, batch_tokens // ds["max_len"])
+                else:
+                    ds["batch_size"] = args.batch_size
 
         # [calibration] section overrides CLI defaults.
         calib_sec = toml_cfg.get("calibration", {})
@@ -106,7 +127,9 @@ calib_datasets = load_calib_datasets(args)
 print(f"\nCalibration plan: {len(calib_datasets)} dataset(s)")
 for i, ds in enumerate(calib_datasets):
     lim = ds.get('limit', 'all')
-    print(f"  [{i+1}] {ds['path']}  (limit={lim}, batch={ds['batch_size']}, maxlen={ds['max_len']})")
+    max_len = ds.get("max_len")
+    max_len_str = max_len if max_len is not None else "dynamic"
+    print(f"  [{i+1}] {ds['path']}  (limit={lim}, batch={ds['batch_size']}, maxlen={max_len_str})")
 
 
 # ---------------------------------------------------------------------------
@@ -129,8 +152,13 @@ processor = None
 if has_mm:
     from transformers import AutoProcessor
     from PIL import Image
-    processor = AutoProcessor.from_pretrained(MODEL_ID, trust_remote_code=TRUST_REMOTE)
-    print(f"Loaded multimodal processor for {MODEL_ID}")
+    try:
+        processor = AutoProcessor.from_pretrained(MODEL_ID, trust_remote_code=TRUST_REMOTE)
+        print(f"Loaded multimodal processor for {MODEL_ID}")
+    except OSError:
+        if args.model != "mimo_v25":
+            raise
+        print(f"Deferring MiMo processor construction until model config is loaded for {MODEL_ID}")
 
 
 def _parse_gib(s):
@@ -167,6 +195,12 @@ else:
         device_map="auto",
     )
 
+if has_mm and processor is None and getattr(getattr(model, "config", None), "model_type", None) == "mimo_v2":
+    processor = build_mimo_processor(tokenizer, model.config)
+    print(f"Built MiMo multimodal processor for {MODEL_ID}")
+if has_mm and processor is not None and getattr(processor, "chat_template", None) is None:
+    processor.chat_template = tokenizer.chat_template
+
 # Dtype distribution before quantization.
 print(f"\n{'='*60}")
 print("Data type distribution BEFORE quantization:")
@@ -193,10 +227,25 @@ print(f"{'='*60}")
 # Build calibration batches from all datasets.
 # ---------------------------------------------------------------------------
 
-def _apply_chat_template(messages):
-    tmpl = processor if processor is not None else tokenizer
-    return tmpl.apply_chat_template(
-        messages, tokenize=False, add_generation_prompt=True,
+text_chat_template_counts = defaultdict(int)
+
+
+def _apply_text_chat_template(messages):
+    final_role = messages[-1].get("role") if messages else None
+    if final_role == "assistant":
+        text_chat_template_counts["assistant_continuation"] += 1
+        return tokenizer.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=False,
+            continue_final_message=True,
+        )
+
+    text_chat_template_counts["generation_prompt"] += 1
+    return tokenizer.apply_chat_template(
+        messages,
+        tokenize=False,
+        add_generation_prompt=True,
     )
 
 
@@ -208,28 +257,39 @@ def iter_prompts(path, limit=None):
             j = json.loads(line)
             if "messages" in j:
                 try:
-                    yield _apply_chat_template(j["messages"])
+                    yield _apply_text_chat_template(j["messages"])
                 except Exception:
                     texts = [m["content"] for m in j["messages"] if m.get("role") == "user"]
                     if texts:
+                        text_chat_template_counts["fallback_user_text"] += 1
                         yield " ".join(texts)
             elif "prompt" in j or "text" in j:
+                text_chat_template_counts["raw_prompt"] += 1
                 yield j.get("prompt") or j.get("text")
 
 
 def _tokenize_batch(texts, max_len):
     """Tokenize a batch of text, using processor if available (VL models)."""
+    kwargs = {
+        "text": texts,
+        "padding": True,
+        "return_tensors": "pt",
+    }
+    if max_len is not None:
+        kwargs.update({
+            "truncation": True,
+            "max_length": max_len,
+        })
     if processor is not None:
-        batch = processor(text=texts, padding=True, truncation=True,
-                          max_length=max_len, return_tensors="pt")
+        batch = processor(**kwargs)
+        batch = normalize_processor_inputs(batch)
         # Text-only batches need explicit position_ids to bypass the VL
         # model's compute_3d_position_ids, which fails without image tokens.
-        if "pixel_values" not in batch:
+        if not _has_visual_inputs(batch):
             seq_len = batch["input_ids"].shape[1]
             batch["position_ids"] = torch.arange(seq_len).unsqueeze(0).expand_as(batch["input_ids"])
         return batch
-    return tokenizer(texts, return_tensors="pt", padding=True,
-                     truncation=True, max_length=max_len)
+    return tokenizer(**kwargs)
 
 
 def build_batches(prompts, max_len, batch_size):
@@ -243,50 +303,292 @@ def build_batches(prompts, max_len, batch_size):
         yield _tokenize_batch(buf, max_len)
 
 
+def _messages_with_answer_prefix(messages):
+    messages = copy.deepcopy(messages)
+    if messages and messages[-1].get("role") == "assistant":
+        content = messages[-1].get("content")
+        if not content:
+            messages[-1]["content"] = "Answer:"
+        elif isinstance(content, str) and not content.startswith("Answer:"):
+            messages[-1]["content"] = f"Answer: {content}"
+    else:
+        messages.append({"role": "assistant", "content": "Answer:"})
+    return messages
+
+
+def _apply_mm_chat_template(messages):
+    kwargs = {
+        "tokenize": False,
+        "add_generation_prompt": False,
+        "continue_final_message": True,
+    }
+    if _is_mimo_v2_model():
+        kwargs["enable_thinking"] = False
+    try:
+        return processor.apply_chat_template(messages, **kwargs)
+    except TypeError:
+        kwargs.pop("enable_thinking", None)
+        return processor.apply_chat_template(messages, **kwargs)
+
+
+def _has_visual_inputs(batch):
+    return any(
+        key in batch
+        for key in ("pixel_values", "image_embeds", "video_pixel_values", "video_embeds")
+    )
+
+
+def _is_mimo_v2_model():
+    return getattr(getattr(model, "config", None), "model_type", None) == "mimo_v2"
+
+
+def _config_value(name, default=None):
+    value = getattr(model.config, name, None)
+    if value is not None:
+        return value
+    processor_config = getattr(model.config, "processor_config", None) or {}
+    if isinstance(processor_config, dict):
+        return processor_config.get(name, default)
+    return getattr(processor_config, name, default)
+
+
+def _media_ref(part, media_type):
+    return part.get(media_type) or part.get("path") or part.get("file") or part.get("url")
+
+
+def _resolve_media_path(ref, dataset_path):
+    path = Path(ref).expanduser()
+    if path.is_absolute():
+        return str(path)
+
+    candidates = [
+        Path(args.data_dir) / path,
+        Path(dataset_path).parent / path,
+        Path.cwd() / path,
+    ]
+    for candidate in candidates:
+        if candidate.exists():
+            return str(candidate)
+    return str(candidates[0])
+
+
+def _load_tensor_value(value, dataset_path, tensor_name=None):
+    if isinstance(value, torch.Tensor):
+        return value.detach().cpu()
+    if isinstance(value, list):
+        return torch.tensor(value)
+    if not isinstance(value, str):
+        raise TypeError(f"Unsupported tensor value {type(value).__name__}")
+
+    path = Path(_resolve_media_path(value, dataset_path))
+    suffix = path.suffix.lower()
+    if suffix in {".pt", ".pth"}:
+        obj = torch.load(path, map_location="cpu")
+        if isinstance(obj, torch.Tensor):
+            return obj
+        if isinstance(obj, dict):
+            if tensor_name and tensor_name in obj:
+                return obj[tensor_name]
+            tensors = [v for v in obj.values() if isinstance(v, torch.Tensor)]
+            if tensors:
+                return tensors[0]
+        raise ValueError(f"No tensor found in {path}")
+    if suffix == ".safetensors":
+        from safetensors.torch import load_file
+
+        tensors = load_file(path, device="cpu")
+        if tensor_name and tensor_name in tensors:
+            return tensors[tensor_name]
+        return tensors[sorted(tensors)[0]]
+    if suffix == ".npy":
+        import numpy as np
+
+        return torch.from_numpy(np.load(path))
+    if suffix == ".json":
+        with open(path) as f:
+            return torch.tensor(json.load(f))
+
+    raise ValueError(f"Unsupported tensor file type: {path}")
+
+
+def _ensure_mimo_audio_tokenizer():
+    return ensure_mimo_audio_tokenizer(
+        model=model,
+        model_id=MODEL_ID,
+        fallback_model_id=cfg.model_id,
+        log_file=sys.stdout,
+    )
+
+
+def _load_audio_mel(audio_path):
+    return load_audio_mel(audio_path, _ensure_mimo_audio_tokenizer())
+
+
+def _audio_codes_from_mels(mels):
+    _ensure_mimo_audio_tokenizer()
+    return audio_codes_from_mels(model, mels)
+
+
+def _prepare_audio_part(part, dataset_path):
+    if "audio_embeds" in part:
+        embeds = _load_tensor_value(part["audio_embeds"], dataset_path, tensor_name=part.get("tensor_name"))
+        if embeds.dim() != 2:
+            raise ValueError(f"audio_embeds must be 2D [N, H], got {tuple(embeds.shape)}")
+        return {"embeds": embeds, "placeholder_count": embeds.shape[0]}
+
+    if "audio_codes" in part:
+        codes = _load_tensor_value(part["audio_codes"], dataset_path, tensor_name=part.get("tensor_name")).long()
+        if codes.dim() == 1:
+            codes = codes.unsqueeze(-1)
+        if codes.dim() != 2:
+            raise ValueError(f"audio_codes must be 2D [T, C], got {tuple(codes.shape)}")
+        codes = pad_audio_codes_to_group_boundary(codes, model.config)
+        return {"codes": codes, "placeholder_count": audio_placeholder_count_from_codes(codes, model.config)}
+
+    if "audio_mels" in part:
+        mel = _load_tensor_value(part["audio_mels"], dataset_path, tensor_name=part.get("tensor_name")).float()
+        codes = pad_audio_codes_to_group_boundary(_audio_codes_from_mels([mel])[0], model.config)
+        return {"codes": codes, "placeholder_count": audio_placeholder_count_from_codes(codes, model.config)}
+
+    audio_ref = _media_ref(part, "audio")
+    if audio_ref:
+        mel = _load_audio_mel(_resolve_media_path(audio_ref, dataset_path))
+        codes = pad_audio_codes_to_group_boundary(_audio_codes_from_mels([mel])[0], model.config)
+        return {"codes": codes, "placeholder_count": audio_placeholder_count_from_codes(codes, model.config)}
+
+    return None
+
+
 def iter_mm_samples(path, limit=None):
-    """Yield (messages, [PIL.Image]) from multimodal JSONL."""
+    """Yield multimodal samples from JSONL with image, video, and audio parts."""
     with open(path) as f:
         for i, line in enumerate(f):
             if limit is not None and i >= limit:
                 break
             j = json.loads(line)
             messages = j.get("messages", [])
+            processed_messages = copy.deepcopy(messages)
             images = []
-            for msg in messages:
+            videos = []
+            audios = []
+            for msg in processed_messages:
                 content = msg.get("content", [])
                 if isinstance(content, str):
                     continue
+                new_content = []
                 for part in content:
+                    new_content.append(part)
                     if part.get("type") == "image":
-                        img_path = part.get("image", "")
+                        img_path = _media_ref(part, "image")
                         if img_path:
-                            images.append(Image.open(img_path).convert("RGB"))
-            if images:
-                yield messages, images
+                            images.append(Image.open(_resolve_media_path(img_path, path)).convert("RGB"))
+                    elif part.get("type") == "video":
+                        video_path = _media_ref(part, "video")
+                        if video_path:
+                            resolved_video_path = _resolve_media_path(video_path, path)
+                            videos.append(resolved_video_path)
+                            if video_uses_audio(part, resolved_video_path):
+                                audio_ref = video_audio_source(part, resolved_video_path)
+                                audio_part = {"type": "audio", "audio": audio_ref}
+                                audio = _prepare_audio_part(audio_part, path)
+                                if audio is not None:
+                                    audios.append(audio)
+                                    # SGLang turns video-with-audio into both VIDEO and AUDIO
+                                    # modalities. Keep the prompt modal tokens aligned with
+                                    # that by adding an audio part next to the video part.
+                                    new_content.append(audio_part)
+                    elif part.get("type") == "audio":
+                        audio = _prepare_audio_part(part, path)
+                        if audio is not None:
+                            audios.append(audio)
+                msg["content"] = new_content
+            if images or videos or audios:
+                yield {
+                    "messages": processed_messages,
+                    "images": images,
+                    "videos": videos,
+                    "audios": audios,
+                }
 
 
 def build_mm_batches(samples, max_len, batch_size):
     """Build multimodal batches using the processor."""
     buf_texts = []
     buf_images = []
-    for messages, images in samples:
-        text = processor.apply_chat_template(
-            messages, tokenize=False, add_generation_prompt=True,
-        )
+    buf_videos = []
+    buf_audio_codes = []
+    buf_audio_embeds = []
+    buf_audio_counts = []
+
+    def flush():
+        if not buf_texts:
+            return None
+        if buf_audio_codes and buf_audio_embeds:
+            raise ValueError("A single multimodal batch cannot mix audio_codes and audio_embeds")
+
+        kwargs = {
+            "text": buf_texts,
+            "padding": True,
+            "return_tensors": "pt",
+        }
+        if max_len is not None:
+            kwargs.update({
+                "truncation": True,
+                "max_length": max_len,
+            })
+        if buf_images:
+            kwargs["images"] = buf_images
+        if buf_videos:
+            kwargs["videos"] = buf_videos
+            kwargs.update(mimo_video_processor_kwargs())
+        batch = processor(**kwargs)
+        batch = normalize_processor_inputs(batch)
+        if _is_mimo_v2_model() and buf_images:
+            replace_mimo_image_pixels(batch, buf_images, model.config)
+        if buf_audio_codes:
+            batch["audio_codes"] = torch.cat(buf_audio_codes, dim=0).long()
+        if buf_audio_embeds:
+            batch["audio_embeds"] = torch.cat(buf_audio_embeds, dim=0)
+        if buf_audio_counts:
+            audio_token_id = _config_value("audio_token_id")
+            if audio_token_id is None:
+                raise ValueError("Audio calibration data requires model.config.audio_token_id")
+            expected = sum(buf_audio_counts)
+            actual = int((batch["input_ids"] == int(audio_token_id)).sum().item())
+            if actual != expected:
+                raise ValueError(
+                    "Audio placeholder mismatch: "
+                    f"tokenized prompt has {actual} audio token(s), but audio payload expects {expected}"
+                )
+        if not _has_visual_inputs(batch):
+            seq_len = batch["input_ids"].shape[1]
+            batch["position_ids"] = torch.arange(seq_len).unsqueeze(0).expand_as(batch["input_ids"])
+        return batch
+
+    for sample in samples:
+        text = _apply_mm_chat_template(_messages_with_answer_prefix(sample["messages"]))
+        audio_counts = [audio["placeholder_count"] for audio in sample["audios"]]
+        if audio_counts:
+            text = expand_audio_placeholders(text, audio_counts)
         buf_texts.append(text)
-        buf_images.extend(images)
+        buf_images.extend(sample["images"])
+        buf_videos.extend(sample["videos"])
+        buf_audio_counts.extend(audio_counts)
+        for audio in sample["audios"]:
+            if "codes" in audio:
+                buf_audio_codes.append(audio["codes"])
+            elif "embeds" in audio:
+                buf_audio_embeds.append(audio["embeds"])
         if len(buf_texts) == batch_size:
-            yield processor(
-                text=buf_texts, images=buf_images, padding=True,
-                truncation=True, max_length=max_len, return_tensors="pt",
-            )
+            yield flush()
             buf_texts = []
             buf_images = []
+            buf_videos = []
+            buf_audio_codes = []
+            buf_audio_embeds = []
+            buf_audio_counts = []
     if buf_texts:
-        yield processor(
-            text=buf_texts, images=buf_images, padding=True,
-            truncation=True, max_length=max_len, return_tensors="pt",
-        )
+        yield flush()
 
 
 # Pre-build all batches, tagged with dataset index for logging.
@@ -295,19 +597,36 @@ for ds_idx, ds in enumerate(calib_datasets):
     if ds.get("multimodal", False):
         ds_batches = list(build_mm_batches(
             iter_mm_samples(ds["path"], limit=ds.get("limit")),
-            max_len=ds["max_len"],
+            max_len=ds.get("max_len"),
             batch_size=ds["batch_size"],
         ))
     else:
         ds_batches = list(build_batches(
             iter_prompts(ds["path"], limit=ds.get("limit")),
-            max_len=ds["max_len"],
+            max_len=ds.get("max_len"),
             batch_size=ds["batch_size"],
         ))
     print(f"  Dataset [{ds_idx+1}]: {len(ds_batches)} batches")
     all_batches.extend((ds_idx, b) for b in ds_batches)
 
 print(f"  Total: {len(all_batches)} batches across {len(calib_datasets)} dataset(s)")
+if text_chat_template_counts:
+    counts = ", ".join(f"{key}={value}" for key, value in sorted(text_chat_template_counts.items()))
+    print(f"  Text prompt formats: {counts}")
+if _is_mimo_v2_model():
+    converted = precompute_mimo_visual_embeds_for_batches(
+        MODEL_ID,
+        model.config,
+        all_batches,
+    )
+    if converted:
+        print(f"Precomputed MiMo visual embeddings for {converted} calibration batch tensor(s)")
+if getattr(model, "audio_tokenizer", None) is not None:
+    # Audio media has already been converted to compact codes in all_batches.
+    # Keep the tokenizer sidecar out of ModelOpt wrapping and checkpoint export.
+    model.audio_tokenizer = None
+    gc.collect()
+    torch.cuda.empty_cache()
 
 model.eval()
 for p in model.parameters():
@@ -366,6 +685,37 @@ def _restore_amax(m, path):
     print(f"Restored {restored}/{len(saved)} calibrator amaxes from {path}")
 
 
+_MIMO_ALLOWED_QUANTIZER_RE = re.compile(
+    r"^model\.layers\.\d+\.mlp\.experts\.\d+\."
+    r"(?:gate_proj|up_proj|down_proj)\.(?:weight_quantizer|input_quantizer)$"
+)
+
+
+def _validate_mimo_enabled_quantizers(m):
+    if args.model != "mimo_v25":
+        return
+    enabled = []
+    bad = []
+    for name, mod in m.named_modules():
+        is_enabled = getattr(mod, "is_enabled", None)
+        if is_enabled is None:
+            continue
+        if bool(is_enabled):
+            enabled.append(name)
+            if not _MIMO_ALLOWED_QUANTIZER_RE.match(name):
+                bad.append(name)
+
+    if bad:
+        sample = "\n    ".join(bad[:32])
+        raise RuntimeError(
+            "MiMo quantization is configured for routed expert MLPs only, "
+            f"but found {len(bad)} enabled non-expert quantizer(s):\n    {sample}"
+        )
+    if not enabled:
+        raise RuntimeError("MiMo quantization has no enabled routed expert MLP quantizers")
+    print(f"  MiMo enabled quantizers: {len(enabled)} routed expert MLP quantizer(s)")
+
+
 def _override_quantile_levels(m):
     """Override quantile levels on all QuantileCalibrators if specified in config."""
     if not hasattr(args, "quantiles"):
@@ -386,6 +736,7 @@ def forward_loop(m):
     input_device = next(m.parameters()).device
     resume = args.resume_batch
 
+    _validate_mimo_enabled_quantizers(m)
     _override_quantile_levels(m)
 
     if args.resume_amax:
@@ -401,7 +752,7 @@ def forward_loop(m):
             cur_ds = ds_idx
             ds = calib_datasets[ds_idx]
             print(f"\n  --- Dataset [{ds_idx+1}]: {os.path.basename(ds['path'])} "
-                  f"(batch={ds['batch_size']}, maxlen={ds['max_len']}) ---")
+                  f"(batch={ds['batch_size']}, maxlen={ds.get('max_len', 'dynamic')}) ---")
         print(f"  Batch {i}/{len(all_batches)}...")
         kwargs = {
             k: v.to(input_device, non_blocking=True)
@@ -422,8 +773,14 @@ def forward_loop(m):
 # Quantize.
 # ---------------------------------------------------------------------------
 
-qcfg = copy.deepcopy(mtq.NVFP4_DEFAULT_CFG)
+base_qcfg = copy.deepcopy(mtq.NVFP4_DEFAULT_CFG)
+qcfg = copy.deepcopy(base_qcfg)
 for pattern, override in cfg.get_all_quant_overrides().items():
+    if override == {"enable": True}:
+        if pattern.endswith("weight_quantizer"):
+            override = copy.deepcopy(base_qcfg["quant_cfg"]["*weight_quantizer"])
+        elif pattern.endswith("input_quantizer"):
+            override = copy.deepcopy(base_qcfg["quant_cfg"]["*input_quantizer"])
     qcfg["quant_cfg"][pattern] = override
 
 if args.calib_method == "quantile":
@@ -593,5 +950,6 @@ else:
     print("\nExporting quantized model to HF format...")
     prepare_fn = loader.prepare_export if loader is not None else None
     export_hf(model, export_dir=args.export_dir, prepare_fn=prepare_fn,
-              extra_mtp_prefixes=cfg.extra_mtp_prefixes)
+              extra_mtp_prefixes=cfg.extra_mtp_prefixes,
+              preserve_remote_code=cfg.preserve_remote_code)
     print(f"Quantized model exported to {args.export_dir}")

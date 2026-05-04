@@ -12,7 +12,10 @@ all-expert activation, which biases downstream scales.
 import torch
 import torch.nn as nn
 from modelopt.torch.quantization.nn import QuantModule, QuantModuleRegistry
-from modelopt.torch.quantization.plugins.huggingface import _QuantSparseMoe
+try:
+    from modelopt.torch.quantization.plugins.huggingface import _QuantSparseMoe
+except ImportError:
+    from modelopt.torch.quantization.plugins.huggingface import _QuantMoeSparseMoe as _QuantSparseMoe
 
 
 def patch_glm5_attention_indexer():

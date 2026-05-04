@@ -43,10 +43,16 @@ def _detect_layer_prefix(weight_map):
     Returns e.g. 'model.layers.' or 'model.language_model.layers.' depending
     on whether the checkpoint is a text-only or VL model.
     """
+    candidates = defaultdict(set)
     for key in weight_map:
         m = re.match(r"^(.*?layers\.)\d+\.", key)
         if m:
-            return m.group(1)
+            candidates[m.group(1)].add(int(key[m.end(1):].split(".", 1)[0]))
+    if candidates:
+        # Some multimodal side towers also contain modules named layers.N
+        # (MiMo audio does this). The main decoder has by far the largest
+        # layer-index set, so use that as the streaming layer prefix.
+        return max(candidates.items(), key=lambda item: len(item[1]))[0]
     return "model.layers."
 
 
@@ -67,6 +73,28 @@ def _resolve_snapshot_dir(model_id):
         f"Cannot resolve snapshot dir for {model_id}. "
         f"Pass a local path or ensure the model is cached."
     )
+
+
+def _iter_safetensors_files(snapshot_dir):
+    for name in sorted(os.listdir(snapshot_dir)):
+        if name.endswith(".safetensors") and name != "model_mtp.safetensors":
+            yield name
+
+
+def _build_weight_map_from_shards(snapshot_dir):
+    """Build a weight map from safetensors metadata.
+
+    Some repos publish an index whose shard names differ from the actual files
+    in cache. Scanning safetensors keys is metadata-only and avoids depending
+    on those stale shard filenames.
+    """
+    weight_map = {}
+    for shard_file in _iter_safetensors_files(snapshot_dir):
+        shard_path = os.path.join(snapshot_dir, shard_file)
+        with safe_open(shard_path, framework="pt", device="cpu") as f:
+            for key in f.keys():
+                weight_map[key] = shard_file
+    return weight_map
 
 
 class StreamingModelLoader:
@@ -99,11 +127,23 @@ class StreamingModelLoader:
         with open(index_path) as f:
             index = json.load(f)
         self.weight_map = index["weight_map"]
+        missing_shards = {
+            shard
+            for shard in set(self.weight_map.values())
+            if not os.path.exists(os.path.join(self.snapshot_dir, shard))
+        }
+        if missing_shards:
+            print(
+                "  Rebuilding safetensors weight map from local shards "
+                f"({len(missing_shards)} indexed shard names missing)"
+            )
+            self.weight_map = _build_weight_map_from_shards(self.snapshot_dir)
         self._layer_prefix = _detect_layer_prefix(self.weight_map)
 
         # Will be populated during load_model
         self.storage_map = {}  # layer_idx -> device string
         self._hook_handles = []
+        self._model_state_keys = None
 
     def load_model(self, register_moe_fn=None, model_cls=None):
         """Load the model with streaming hooks. Returns the model.
@@ -118,12 +158,17 @@ class StreamingModelLoader:
         if register_moe_fn is not None:
             register_moe_fn()
 
-        print(f"Loading config from {self.model_id}...")
-        config = AutoConfig.from_pretrained(
-            self.model_id, trust_remote_code=self.trust_remote_code
-        )
-
         cls = model_cls or AutoModelForCausalLM
+        print(f"Loading config from {self.model_id}...")
+        if cls is AutoModelForCausalLM:
+            config = AutoConfig.from_pretrained(
+                self.model_id, trust_remote_code=self.trust_remote_code
+            )
+        else:
+            config = cls.config_class.from_pretrained(
+                self.model_id, trust_remote_code=self.trust_remote_code
+            )
+
         print(f"Creating model on meta device via {cls.__name__}...")
         if cls is AutoModelForCausalLM:
             with init_empty_weights():
@@ -255,7 +300,8 @@ class StreamingModelLoader:
 
     def _get_permanent_param_keys(self):
         """Get checkpoint keys for non-layer modules (embed, norm, lm_head)."""
-        return [k for k in self.weight_map if _extract_layer_idx(k) is None]
+        decoder_layer_re = re.compile(rf"^{re.escape(self._layer_prefix)}\d+\.")
+        return [k for k in self.weight_map if not decoder_layer_re.match(k)]
 
     def _materialize_permanent_modules(self, model):
         """Load embed_tokens, norm, rotary_emb, lm_head to GPU 0.
@@ -281,12 +327,17 @@ class StreamingModelLoader:
             if hasattr(m, "language_model") and name == "language_model":
                 for lm_name, lm_child in child.named_children():
                     if lm_name != "layers":
+                        _zero_materialize_meta_tensors(
+                            lm_child, "cuda:0", f"{name}.{lm_name}"
+                        )
                         lm_child.to("cuda:0")
                 continue
+            _zero_materialize_meta_tensors(child, "cuda:0", name)
             child.to("cuda:0")
         for name, child in model.named_children():
             if name == "model":
                 continue
+            _zero_materialize_meta_tensors(child, "cuda:0", name)
             child.to("cuda:0")
 
     def _materialize_layer(self, model, layer_idx, device):
@@ -301,7 +352,11 @@ class StreamingModelLoader:
         checkpoint has per-expert keys (experts.{i}.gate_proj.weight) that must
         be fused into 3D parameters (experts.gate_up_proj, experts.down_proj).
         """
-        # Separate expert keys from regular keys
+        model_keys = self._get_model_state_keys(model)
+
+        # Separate expert keys from regular keys. Only fuse per-expert
+        # checkpoint weights when the in-memory model actually has fused
+        # parameters. MiMo already uses experts.{i}.{proj}.weight modules.
         expert_pattern = re.compile(
             r"^(.*\.mlp\.experts)\.(\d+)\.(gate_proj|up_proj|down_proj)\.weight$"
         )
@@ -311,9 +366,17 @@ class StreamingModelLoader:
 
         for key in param_keys:
             m = expert_pattern.match(key)
+            if key not in model_keys and not m:
+                continue
             if m:
                 prefix, idx, proj = m.group(1), int(m.group(2)), m.group(3)
-                expert_groups[prefix][idx][proj] = key
+                if (
+                    f"{prefix}.gate_up_proj" in model_keys
+                    or f"{prefix}.down_proj" in model_keys
+                ):
+                    expert_groups[prefix][idx][proj] = key
+                elif key in model_keys:
+                    regular_keys.append(key)
             else:
                 regular_keys.append(key)
 
@@ -477,21 +540,48 @@ class StreamingModelLoader:
                         continue
                     tensor = f.get_tensor(key)
                     relative = key[len(prefix):]
-                    relative = _remap_expert_key(relative)
+                    relative = _remap_expert_key(module, relative)
+                    if not _module_has_state_key(module, relative):
+                        continue
                     _assign_tensor_to_module(module, relative, tensor, "cpu")
 
+    def _get_model_state_keys(self, model):
+        if self._model_state_keys is None:
+            self._model_state_keys = (
+                set(dict(model.named_parameters()).keys())
+                | set(dict(model.named_buffers()).keys())
+            )
+        return self._model_state_keys
 
-def _remap_expert_key(relative_key):
+
+def _remap_expert_key(module, relative_key):
     """Remap checkpoint expert key to match module tree after _QuantFusedExperts._setup.
 
     Checkpoint format: mlp.experts.{idx}.{proj}.weight
     Module format:     mlp.experts.{proj}.{idx}.weight
     """
     m = re.match(r"(mlp\.experts)\.(\d+)\.(gate_proj|up_proj|down_proj)\.weight$", relative_key)
-    if m:
+    if m and _has_projection_first_experts(module):
         prefix, idx, proj = m.group(1), m.group(2), m.group(3)
         return f"{prefix}.{proj}.{idx}.weight"
     return relative_key
+
+
+def _has_projection_first_experts(module):
+    mlp = getattr(module, "mlp", None)
+    experts = getattr(mlp, "experts", None)
+    return (
+        experts is not None
+        and hasattr(experts, "gate_proj")
+        and isinstance(getattr(experts, "gate_proj", None), nn.ModuleList)
+    )
+
+
+def _module_has_state_key(module, relative_key):
+    return (
+        relative_key in dict(module.named_parameters()).keys()
+        or relative_key in dict(module.named_buffers()).keys()
+    )
 
 
 def _assign_tensor_to_module(module, relative_key, tensor, device):
@@ -515,6 +605,84 @@ def _assign_tensor_to_module(module, relative_key, tensor, device):
         )
     else:
         setattr(target, param_name, tensor.to(device=device))
+
+
+def _zero_materialize_meta_tensors(module, device, prefix=""):
+    """Materialize missing permanent tensors before moving a meta-built module.
+
+    Streaming construction creates the whole model under init_empty_weights().
+    Checkpoint-backed tensors are assigned explicitly, but tensors absent from
+    the checkpoint, such as MiMo's visual merger biases, remain on meta. Plain
+    module.to(device) cannot copy those, so initialize only the still-meta
+    tensors to zero and leave already-loaded checkpoint tensors untouched.
+    """
+    for name, param in list(module.named_parameters()):
+        if param.device.type != "meta":
+            continue
+        full_name = f"{prefix}.{name}" if prefix else name
+        if full_name == "audio_encoder.input_local_transformer.embed_tokens.weight":
+            # The upstream MiMo remote code explicitly ignores this missing
+            # weight, and the audio encoder calls Qwen2Model via inputs_embeds.
+            value = torch.zeros(param.shape, dtype=param.dtype, device=device)
+            set_module_tensor_to_device(module, name, device, value=value)
+            continue
+        if not name.endswith(".bias") and name != "bias":
+            raise RuntimeError(
+                "Permanent module tensor is still on meta after checkpoint load: "
+                f"{full_name}. Refusing to zero-initialize a non-bias parameter."
+            )
+        value = torch.zeros(param.shape, dtype=param.dtype, device=device)
+        set_module_tensor_to_device(module, name, device, value=value)
+    for name, buf in list(module.named_buffers()):
+        if buf.device.type != "meta":
+            continue
+        full_name = f"{prefix}.{name}" if prefix else name
+        rotary_value = _init_rotary_buffer(module, name, device)
+        if rotary_value is not None:
+            set_module_tensor_to_device(module, name, device, value=rotary_value)
+            continue
+        if buf.numel() != 0:
+            raise RuntimeError(
+                "Permanent module buffer is still on meta after checkpoint load: "
+                f"{full_name}. Add explicit initialization instead of silently "
+                "zeroing it."
+            )
+        value = torch.zeros(buf.shape, dtype=buf.dtype, device=device)
+        set_module_tensor_to_device(module, name, device, value=value)
+
+
+def _init_rotary_buffer(module, buffer_name, device):
+    if not (
+        buffer_name.endswith("inv_freq")
+        or buffer_name.endswith("original_inv_freq")
+    ):
+        return None
+
+    parts = buffer_name.split(".")
+    target = module
+    for part in parts[:-1]:
+        target = target[int(part)] if part.isdigit() else getattr(target, part)
+
+    if parts[-1] == "original_inv_freq":
+        inv_freq = getattr(target, "inv_freq", None)
+        if isinstance(inv_freq, torch.Tensor) and inv_freq.device.type != "meta":
+            return inv_freq.detach().clone().to(device=device)
+
+    if hasattr(target, "rope_init_fn") and hasattr(target, "config"):
+        inv_freq, attention_scaling = target.rope_init_fn(target.config, device)
+        if hasattr(target, "attention_scaling"):
+            target.attention_scaling = attention_scaling
+        return inv_freq.to(device=device)
+
+    old = getattr(target, parts[-1])
+    if type(target).__name__ == "MiMoVisionRotaryEmbedding":
+        dim = old.numel() * 2
+        inv_freq = 1.0 / (
+            10000.0 ** (torch.arange(0, dim, 2, dtype=torch.float, device=device) / dim)
+        )
+        return inv_freq
+
+    return None
 
 
 class LayerStreamingHook:
@@ -622,7 +790,9 @@ class LayerStreamingHook:
                     # Module tree (after _QuantFusedExperts._setup):
                     #   mlp.experts.gate_proj.{i}.weight
                     # Remap: experts.N.proj.weight -> experts.proj.N.weight
-                    relative = _remap_expert_key(relative)
+                    relative = _remap_expert_key(module, relative)
+                    if not _module_has_state_key(module, relative):
+                        continue
                     _assign_tensor_to_module(module, relative, tensor, "cuda:0")
 
     def _unload_to_meta(self, module):
