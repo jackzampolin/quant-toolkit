@@ -1,5 +1,9 @@
 .venv/
 __pycache__/
 *.pyc
+*.log
+*.safetensors
+/img.jpg
+/data/multimodal/mimo_audio_calib.jsonl
 uv.lock
 output/
