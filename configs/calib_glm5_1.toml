@@ -4,10 +4,10 @@
 method = "quantile"
 quantiles = [0.99, 0.999, 0.9999, 0.99999]
 
-#[[dataset]]
-#path = "text/agentic_coding_calib_v3.jsonl"
-#max_len = 1024
-#limit = 8192
+[[dataset]]
+path = "text/agentic_coding_calib_v3.jsonl"
+max_len = 1024
+limit = 8192
 
 [[dataset]]
 path = "text/diverse_calib.jsonl"
