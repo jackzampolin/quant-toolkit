@@ -1,0 +1,32 @@
+# Quality-oriented GLM-5.1 calibration using the ModelOpt max calibrator.
+#
+# The public ModelOpt 0.42/0.45 stack does not expose the quantile calibration
+# registry referenced by older quant-toolkit configs, so this is the
+# reproducible path for a full BF16 -> NVFP4 requantization.
+
+[calibration]
+method = "max"
+
+[[dataset]]
+path = "text/agentic_coding_calib_v3.jsonl"
+max_len = 1024
+limit = 8192
+batch_size = 64
+
+[[dataset]]
+path = "text/agentic_coding_calib_generic.jsonl"
+max_len = 1024
+limit = 4096
+batch_size = 64
+
+[[dataset]]
+path = "text/diverse_calib.jsonl"
+max_len = 1024
+limit = 8192
+batch_size = 64
+
+[[dataset]]
+path = "text/deep_calib.jsonl"
+max_len = 8192
+limit = 819
+batch_size = 8

@@ -40,6 +40,14 @@ SCALE_SHARD_NAME = "model-inputscales.safetensors"
 _EXPERT_PROJ_RE = re.compile(
     r"^(.*\.experts)\.(gate_proj|up_proj|down_proj)\.(\d+)\.(.+)$"
 )
+_GLM_W13_WEIGHT_SCALE_RE = re.compile(
+    r"^(model\.layers\.\d+\.mlp\.experts\.\d+)\."
+    r"(gate_proj|up_proj)\.weight_scale_2$"
+)
+_GLM_EXPERT_PROJ_RE = re.compile(
+    r"^(model\.layers\.\d+\.mlp\.experts)\.(\d+)\."
+    r"(gate_proj|up_proj|down_proj)\.(.+)$"
+)
 
 
 def _remap_expert_key_to_checkpoint(key: str) -> str:
@@ -53,6 +61,37 @@ def _remap_expert_key_to_checkpoint(key: str) -> str:
         prefix, proj, idx, suffix = m.group(1), m.group(2), m.group(3), m.group(4)
         return f"{prefix}.{idx}.{proj}.{suffix}"
     return key
+
+
+def _normalize_glm51_hf_quant_config(
+    model: nn.Module, hf_quant_config: dict | None
+) -> dict | None:
+    """Emit GLM-5.1 ignore patterns that vLLM's ModelOpt loader handles safely."""
+    if hf_quant_config is None:
+        return None
+
+    config = getattr(model, "config", None)
+    if getattr(config, "model_type", None) != "glm_moe_dsa":
+        return hf_quant_config
+
+    num_layers = int(getattr(config, "num_hidden_layers", 0) or 0)
+    first_dense = int(getattr(config, "first_k_dense_replace", 0) or 0)
+    if num_layers <= 0:
+        return hf_quant_config
+
+    # ModelOpt 0.42 emits patterns like "model.layers.1", which vLLM's legacy
+    # substring fallback also matches against layers 10-19. Keep the exported
+    # metadata equivalent to Luke's known-good GLM-5.1 checkpoint.
+    ignore = ["lm_head"]
+    ignore.extend(f"model.layers.{idx}.mlp*" for idx in range(first_dense))
+    ignore.append("*shared_experts*")
+    for idx in range(num_layers):
+        ignore.append(f"model.layers.{idx}.self_attn*")
+        ignore.append(f"model.layers.{idx}.self_attn.indexer*")
+
+    hf_quant_config = dict(hf_quant_config)
+    hf_quant_config["ignore"] = ignore
+    return hf_quant_config
 
 
 def _handle_moe_expert_quantizers(model: nn.Module) -> None:
@@ -95,7 +134,7 @@ def _handle_moe_expert_quantizers(model: nn.Module) -> None:
                         if proj_list is not None and isinstance(proj_list, nn.ModuleList):
                             set_expert_quantizer_amax(
                                 modules=list(proj_list),
-                                quantizer_attrs=["input_quantizer", "weight_quantizer"],
+                                quantizer_attrs=["input_quantizer"],
                                 device=torch.device("cpu"),
                             )
                 elif isinstance(sub_module.experts, collections.abc.Iterable):
@@ -118,11 +157,38 @@ def _handle_moe_expert_quantizers(model: nn.Module) -> None:
                             f"Expected linear names: {expert_linear_names}. "
                             f"Original error: {e}"
                         ) from e
+
                 else:
                     raise NotImplementedError(
                         f"MoE model with experts type "
                         f"'{type(sub_module.experts).__name__}' is not supported."
                     )
+
+
+def _tie_glm_gate_up_weight_quantizer_amax(model: nn.Module) -> int:
+    """Keep GLM gate/up weight scales identical for fused W13 export."""
+    tied = 0
+    for _, module in model.named_modules():
+        if not (
+            hasattr(module, "gate_proj")
+            and hasattr(module, "up_proj")
+            and isinstance(getattr(module, "gate_proj", None), nn.ModuleList)
+        ):
+            continue
+        gate_proj = module.gate_proj
+        up_proj = module.up_proj
+        for idx in range(min(len(gate_proj), len(up_proj))):
+            gate_q = getattr(gate_proj[idx], "weight_quantizer", None)
+            up_q = getattr(up_proj[idx], "weight_quantizer", None)
+            if gate_q is None or up_q is None:
+                continue
+            if not hasattr(gate_q, "_amax") or not hasattr(up_q, "_amax"):
+                continue
+            shared = torch.maximum(gate_q._amax, up_q._amax)
+            gate_q._amax.copy_(shared)
+            up_q._amax.copy_(shared)
+            tied += 1
+    return tied
 
 
 def _strip_hooks(module: nn.Module) -> None:
@@ -233,6 +299,9 @@ def export_hf(
 
     # --- Pre-export processing (all on GPU, hooks still intact) ---
     _handle_moe_expert_quantizers(model)
+    tied_gate_up = _tie_glm_gate_up_weight_quantizer_amax(model)
+    if tied_gate_up:
+        print(f"Tied GLM gate/up weight_quantizer amax for {tied_gate_up} experts.")
     resmooth_target = model
     _patched_arch = False
     if hasattr(model, "model") and hasattr(model.model, "language_model"):
@@ -250,6 +319,7 @@ def export_hf(
         del resmooth_target.config.architectures
     quant_config = get_quant_config(model)
     hf_quant_config = convert_hf_quant_config_format(quant_config) if quant_config else None
+    hf_quant_config = _normalize_glm51_hf_quant_config(model, hf_quant_config)
 
     kv_cache_max_bound = 448
     kv_cache_format = quant_config["quantization"]["kv_cache_quant_algo"]
@@ -346,6 +416,8 @@ def export_hf(
     # We need to do this on the weight_map keys. The actual tensor data has
     # already been written, so we re-read shards that need changes.
     _postprocess_shards(export_dir, weight_map, kv_cache_max_bound, kv_cache_format)
+    _fill_missing_glm_expert_input_scales(export_dir, weight_map)
+    _tie_glm_w13_weight_scales(export_dir, weight_map)
 
     # Rename shards to final HF naming (model-00001-of-NNNNN.safetensors).
     _rename_shards(export_dir, weight_map, total_shards)
@@ -462,6 +534,121 @@ def _postprocess_shards(
 
     weight_map.clear()
     weight_map.update(new_weight_map)
+
+
+def _tie_glm_w13_weight_scales(export_dir: Path, weight_map: dict[str, str]) -> None:
+    """Tie exported GLM gate/up weight_scale_2 tensors used by fused W13."""
+    from safetensors.torch import load_file
+
+    pairs: dict[str, dict[str, str]] = {}
+    for key in weight_map:
+        m = _GLM_W13_WEIGHT_SCALE_RE.match(key)
+        if not m:
+            continue
+        prefix, proj = m.group(1), m.group(2)
+        pairs.setdefault(prefix, {})[proj] = key
+
+    groups: dict[tuple[str, str], list[tuple[str, str]]] = {}
+    for proj_keys in pairs.values():
+        gate_key = proj_keys.get("gate_proj")
+        up_key = proj_keys.get("up_proj")
+        if gate_key is None or up_key is None:
+            continue
+        groups.setdefault(
+            (weight_map[gate_key], weight_map[up_key]), []
+        ).append((gate_key, up_key))
+
+    if not groups:
+        return
+
+    tied = 0
+    touched: set[str] = set()
+    for (gate_shard, up_shard), key_pairs in sorted(groups.items()):
+        shard_data = {gate_shard: load_file(str(export_dir / gate_shard))}
+        if up_shard != gate_shard:
+            shard_data[up_shard] = load_file(str(export_dir / up_shard))
+
+        changed = False
+        for gate_key, up_key in key_pairs:
+            gate = shard_data[gate_shard][gate_key]
+            up = shard_data[up_shard][up_key]
+            shared = torch.maximum(gate.float(), up.float())
+            gate_shared = shared.to(gate.dtype).clone()
+            up_shared = shared.to(up.dtype).clone()
+            if not torch.equal(gate, gate_shared):
+                shard_data[gate_shard][gate_key] = gate_shared
+                changed = True
+            if not torch.equal(up, up_shared):
+                shard_data[up_shard][up_key] = up_shared
+                changed = True
+            tied += 1
+
+        if changed:
+            for shard_name, data in shard_data.items():
+                save_file(data, str(export_dir / shard_name))
+                touched.add(shard_name)
+
+    print(
+        f"  Tied {tied} GLM W13 gate/up weight_scale_2 pairs "
+        f"across {len(touched)} shard(s)"
+    )
+
+
+def _fill_missing_glm_expert_input_scales(
+    export_dir: Path, weight_map: dict[str, str]
+) -> None:
+    """Fill uncalibrated GLM expert input scales so all expert projections load."""
+    from safetensors.torch import load_file
+
+    expected: set[str] = set()
+    existing: dict[tuple[str, str], list[torch.Tensor]] = {}
+    scale_path = export_dir / SCALE_SHARD_NAME
+    scale_data = load_file(str(scale_path)) if scale_path.exists() else {}
+
+    for key in weight_map:
+        m = _GLM_EXPERT_PROJ_RE.match(key)
+        if not m:
+            continue
+        prefix, expert_idx, proj, suffix = m.groups()
+        if suffix != "weight_scale_2":
+            continue
+        input_key = f"{prefix}.{expert_idx}.{proj}.input_scale"
+        expected.add(input_key)
+
+    for key, tensor in scale_data.items():
+        m = _GLM_EXPERT_PROJ_RE.match(key)
+        if not m:
+            continue
+        prefix, _, proj, suffix = m.groups()
+        if suffix != "input_scale":
+            continue
+        group_proj = "gate_up" if proj in ("gate_proj", "up_proj") else "down_proj"
+        existing.setdefault((prefix, group_proj), []).append(tensor.detach().float())
+
+    fallback: dict[tuple[str, str], torch.Tensor] = {}
+    for group, tensors in existing.items():
+        if tensors:
+            fallback[group] = torch.stack(tensors).max(dim=0).values
+
+    missing = sorted(k for k in expected if k not in weight_map)
+    filled = 0
+    for key in missing:
+        m = _GLM_EXPERT_PROJ_RE.match(key)
+        if not m:
+            continue
+        prefix, _, proj, _ = m.groups()
+        group_proj = "gate_up" if proj in ("gate_proj", "up_proj") else "down_proj"
+        value = fallback.get((prefix, group_proj))
+        if value is None:
+            warnings.warn(f"No fallback input_scale available for {key}; skipping")
+            continue
+        scale_data[key] = value.clone()
+        weight_map[key] = SCALE_SHARD_NAME
+        filled += 1
+
+    if filled:
+        save_file(scale_data, str(scale_path))
+        print(f"  Filled {filled} missing GLM expert input_scale tensors")
 
 
 def _rename_shards(

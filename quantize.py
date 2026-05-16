@@ -368,7 +368,7 @@ def _restore_amax(m, path):
 
 def _override_quantile_levels(m):
     """Override quantile levels on all QuantileCalibrators if specified in config."""
-    if not hasattr(args, "quantiles"):
+    if args.calib_method != "quantile" or not hasattr(args, "quantiles"):
         return
     from modelopt.torch.quantization.calib.quantile import QuantileCalibrator, P2QuantileEstimator
     count = 0
@@ -428,13 +428,12 @@ for pattern, override in cfg.get_all_quant_overrides().items():
 
 if args.calib_method == "quantile":
     qcfg["algorithm"] = "quantile"
-    qcfg["quant_cfg"]["*input_quantizer"]["calibrator"] = "quantile"
 
 print(f"\nQuantizing with NVFP4 (model={args.model}, calib={args.calib_method})...")
 model = mtq.quantize(model, qcfg, forward_loop)
 print(f"{'='*60}")
 
-if args.save_quantiles:
+if args.save_quantiles and args.calib_method == "quantile":
     from modelopt.torch.quantization.calib.quantile import save_quantile_data
     os.makedirs(os.path.dirname(os.path.abspath(args.save_quantiles)), exist_ok=True)
     n_saved = save_quantile_data(model, args.save_quantiles)
