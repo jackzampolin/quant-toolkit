@@ -165,6 +165,42 @@ def _handle_moe_expert_quantizers(model: nn.Module) -> None:
                     )
 
 
+def _weight_quantizer_amax_or_weight_absmax(module: nn.Module) -> torch.Tensor | None:
+    """Return a CPU fp32 amax for an expert Linear weight quantizer.
+
+    ModelOpt may leave some MoE expert weight quantizers without ``amax`` until
+    export-time packing, where it computes the value from weights. For fused
+    GLM W13 we need gate/up to share the same weight amax before packing, so
+    compute that fallback here instead of letting ModelOpt compute each side
+    independently later.
+    """
+    quantizer = getattr(module, "weight_quantizer", None)
+    if quantizer is None:
+        return None
+
+    values: list[torch.Tensor] = []
+    existing = getattr(quantizer, "amax", None)
+    if existing is not None:
+        values.append(torch.as_tensor(existing, dtype=torch.float32, device="cpu"))
+
+    weight = getattr(module, "weight", None)
+    if weight is not None:
+        values.append(weight.detach().float().abs().max().cpu())
+
+    if not values:
+        return None
+
+    return torch.stack([v.reshape(()) for v in values]).max()
+
+
+def _set_weight_quantizer_amax(module: nn.Module, value: torch.Tensor) -> bool:
+    quantizer = getattr(module, "weight_quantizer", None)
+    if quantizer is None:
+        return False
+    quantizer.amax = value.detach().clone().to(dtype=torch.float32, device="cpu")
+    return True
+
+
 def _tie_glm_gate_up_weight_quantizer_amax(model: nn.Module) -> int:
     """Keep GLM gate/up weight scales identical for fused W13 export."""
     tied = 0
@@ -182,11 +218,14 @@ def _tie_glm_gate_up_weight_quantizer_amax(model: nn.Module) -> int:
             up_q = getattr(up_proj[idx], "weight_quantizer", None)
             if gate_q is None or up_q is None:
                 continue
-            if not hasattr(gate_q, "_amax") or not hasattr(up_q, "_amax"):
+
+            gate_amax = _weight_quantizer_amax_or_weight_absmax(gate_proj[idx])
+            up_amax = _weight_quantizer_amax_or_weight_absmax(up_proj[idx])
+            if gate_amax is None or up_amax is None:
                 continue
-            shared = torch.maximum(gate_q._amax, up_q._amax)
-            gate_q._amax.copy_(shared)
-            up_q._amax.copy_(shared)
+            shared = torch.maximum(gate_amax, up_amax)
+            _set_weight_quantizer_amax(gate_proj[idx], shared)
+            _set_weight_quantizer_amax(up_proj[idx], shared)
             tied += 1
     return tied
 
