@@ -191,6 +191,18 @@ def _tie_glm_gate_up_weight_quantizer_amax(model: nn.Module) -> int:
     return tied
 
 
+def _tie_glm_gate_up_weight_quantizer_amax_for_subtree(module: nn.Module) -> int:
+    """Tie GLM gate/up expert weight amax inside one materialized subtree.
+
+    Streaming export materializes many GLM layers only inside the per-layer
+    export loop. A model-wide pre-pass can miss meta/offloaded layers, and
+    tying only the exported weight_scale_2 after packing makes the checkpoint
+    internally inconsistent. This must run after materialization and before
+    _process_quantized_modules packs FP4 weights.
+    """
+    return _tie_glm_gate_up_weight_quantizer_amax(module)
+
+
 def _strip_hooks(module: nn.Module) -> None:
     """Remove accelerate hooks from a single module and all its children."""
     try:
@@ -339,6 +351,7 @@ def export_hf(
     total_tensors = 0
 
     print("\nStreaming export — processing layers...")
+    streaming_tied_gate_up = 0
     for prefix, module in _enumerate_top_level_modules(model):
         print(f"  Processing {prefix}...")
 
@@ -352,6 +365,10 @@ def export_hf(
             _strip_hooks(module)
             module.to("cpu")
             torch.cuda.empty_cache()
+
+        streaming_tied_gate_up += _tie_glm_gate_up_weight_quantizer_amax_for_subtree(
+            module
+        )
 
         # Pack quantized weights in-place for this subtree (all on CPU now).
         _process_quantized_modules(module, dtype)
@@ -383,6 +400,12 @@ def export_hf(
         for buf_name, buf in module.named_buffers():
             buf.data = torch.empty(0)
         gc.collect()
+
+    if streaming_tied_gate_up:
+        print(
+            "  Streaming pre-pack tied GLM gate/up weight_quantizer amax "
+            f"for {streaming_tied_gate_up} expert pairs"
+        )
 
     # Flush remaining weight tensors.
     if shard:
@@ -562,6 +585,7 @@ def _tie_glm_w13_weight_scales(export_dir: Path, weight_map: dict[str, str]) -> 
         return
 
     tied = 0
+    changed_pairs = 0
     touched: set[str] = set()
     for (gate_shard, up_shard), key_pairs in sorted(groups.items()):
         shard_data = {gate_shard: load_file(str(export_dir / gate_shard))}
@@ -575,12 +599,17 @@ def _tie_glm_w13_weight_scales(export_dir: Path, weight_map: dict[str, str]) -> 
             shared = torch.maximum(gate.float(), up.float())
             gate_shared = shared.to(gate.dtype).clone()
             up_shared = shared.to(up.dtype).clone()
+            pair_changed = False
             if not torch.equal(gate, gate_shared):
                 shard_data[gate_shard][gate_key] = gate_shared
                 changed = True
+                pair_changed = True
             if not torch.equal(up, up_shared):
                 shard_data[up_shard][up_key] = up_shared
                 changed = True
+                pair_changed = True
+            if pair_changed:
+                changed_pairs += 1
             tied += 1
 
         if changed:
@@ -590,8 +619,15 @@ def _tie_glm_w13_weight_scales(export_dir: Path, weight_map: dict[str, str]) -> 
 
     print(
         f"  Tied {tied} GLM W13 gate/up weight_scale_2 pairs "
-        f"across {len(touched)} shard(s)"
+        f"across {len(touched)} shard(s); changed_pairs={changed_pairs}"
     )
+    if changed_pairs:
+        warnings.warn(
+            "GLM W13 weight_scale_2 changed after FP4 packing. This is only "
+            "a safety net; if changed_pairs is nonzero, pre-pack gate/up "
+            "amax tying did not cover all expert pairs and quality may be "
+            "affected."
+        )
 
 
 def _fill_missing_glm_expert_input_scales(
