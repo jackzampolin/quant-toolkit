@@ -165,7 +165,9 @@ def _handle_moe_expert_quantizers(model: nn.Module) -> None:
                     )
 
 
-def _weight_quantizer_amax_or_weight_absmax(module: nn.Module) -> torch.Tensor | None:
+def _weight_quantizer_amax_or_weight_absmax(
+    module: nn.Module, *, compute_from_weight: bool
+) -> torch.Tensor | None:
     """Return a CPU fp32 amax for an expert Linear weight quantizer.
 
     ModelOpt may leave some MoE expert weight quantizers without ``amax`` until
@@ -184,7 +186,7 @@ def _weight_quantizer_amax_or_weight_absmax(module: nn.Module) -> torch.Tensor |
         values.append(torch.as_tensor(existing, dtype=torch.float32, device="cpu"))
 
     weight = getattr(module, "weight", None)
-    if weight is not None:
+    if compute_from_weight and weight is not None:
         values.append(weight.detach().float().abs().max().cpu())
 
     if not values:
@@ -201,7 +203,9 @@ def _set_weight_quantizer_amax(module: nn.Module, value: torch.Tensor) -> bool:
     return True
 
 
-def _tie_glm_gate_up_weight_quantizer_amax(model: nn.Module) -> int:
+def _tie_glm_gate_up_weight_quantizer_amax(
+    model: nn.Module, *, compute_missing_from_weight: bool = False
+) -> int:
     """Keep GLM gate/up weight scales identical for fused W13 export."""
     tied = 0
     for _, module in model.named_modules():
@@ -219,8 +223,14 @@ def _tie_glm_gate_up_weight_quantizer_amax(model: nn.Module) -> int:
             if gate_q is None or up_q is None:
                 continue
 
-            gate_amax = _weight_quantizer_amax_or_weight_absmax(gate_proj[idx])
-            up_amax = _weight_quantizer_amax_or_weight_absmax(up_proj[idx])
+            gate_amax = _weight_quantizer_amax_or_weight_absmax(
+                gate_proj[idx],
+                compute_from_weight=compute_missing_from_weight,
+            )
+            up_amax = _weight_quantizer_amax_or_weight_absmax(
+                up_proj[idx],
+                compute_from_weight=compute_missing_from_weight,
+            )
             if gate_amax is None or up_amax is None:
                 continue
             shared = torch.maximum(gate_amax, up_amax)
@@ -239,7 +249,9 @@ def _tie_glm_gate_up_weight_quantizer_amax_for_subtree(module: nn.Module) -> int
     internally inconsistent. This must run after materialization and before
     _process_quantized_modules packs FP4 weights.
     """
-    return _tie_glm_gate_up_weight_quantizer_amax(module)
+    return _tie_glm_gate_up_weight_quantizer_amax(
+        module, compute_missing_from_weight=True
+    )
 
 
 def _strip_hooks(module: nn.Module) -> None:
