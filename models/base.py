@@ -19,6 +19,7 @@ class ModelQuantConfig:
     extra_quant_overrides: dict = field(default_factory=dict)
     extra_mtp_prefixes: list = field(default_factory=list)
     preserve_remote_code: bool = False
+    processor_trust_remote_code: bool | None = None
 
     def get_model_cls(self):
         """Return explicit model class, or None for AutoModelForCausalLM."""
@@ -27,6 +28,11 @@ class ModelQuantConfig:
     def register_moe(self):
         """Register MoE QuantModules if needed. Override in subclasses."""
         pass
+
+    def get_processor_trust_remote_code(self) -> bool:
+        if self.processor_trust_remote_code is None:
+            return self.trust_remote_code
+        return self.processor_trust_remote_code
 
     def get_all_quant_overrides(self) -> dict:
         overrides = dict(COMMON_QUANT_OVERRIDES)

@@ -563,7 +563,7 @@ def _save_model_metadata(
         ))
     copy_patterns = [
         "tokenizer.json", "tokenizer_config.json", "chat_template.jinja",
-        "special_tokens_map.json", "tokenizer.model",
+        "special_tokens_map.json", "tokenizer.model", "added_tokens.json",
         "preprocessor_config.json", "video_preprocessor_config.json",
         "merges.txt", "vocab.json",
     ]
@@ -577,6 +577,13 @@ def _save_model_metadata(
         if src.exists():
             shutil.copy2(src, export_dir / name)
             copied.append(name)
+
+    if preserve_remote_code:
+        for src in sorted(source_dir.glob("*.py")):
+            if src.name in copied:
+                continue
+            shutil.copy2(src, export_dir / src.name)
+            copied.append(src.name)
 
     if preserve_remote_code:
         for dirname in ("audio_tokenizer",):

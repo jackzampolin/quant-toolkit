@@ -2,6 +2,7 @@
 
 Supports:
   - MiniMaxM2 (built-in transformers): MiniMaxM2Experts
+  - MiniMaxM3-VL (built-in transformers): MiniMaxM3VLExperts
   - GLM-5 / glm_moe_dsa (remote code): GlmMoeDsaMoE + GlmMoeDsaNaiveMoe
   - Qwen3.5 MoE: Qwen3_5MoeSparseMoeBlock + Qwen3_5MoeExperts
 
@@ -15,7 +16,12 @@ from modelopt.torch.quantization.nn import QuantModule, QuantModuleRegistry
 try:
     from modelopt.torch.quantization.plugins.huggingface import _QuantSparseMoe
 except ImportError:
-    from modelopt.torch.quantization.plugins.huggingface import _QuantMoeSparseMoe as _QuantSparseMoe
+    try:
+        from modelopt.torch.quantization.plugins.huggingface import _QuantMoeSparseMoe as _QuantSparseMoe
+    except ImportError:
+        from modelopt.torch.quantization.plugins.huggingface import (
+            _QuantSparseSequentialMoe as _QuantSparseMoe,
+        )
 
 
 def patch_glm5_attention_indexer():
@@ -65,14 +71,17 @@ class _QuantFusedExperts(QuantModule):
     def _setup(self):
         from accelerate import init_empty_weights
 
-        dtype, device = self.gate_up_proj.dtype, self.gate_up_proj.device
         I = self.intermediate_dim
         H = self.hidden_dim
 
-        def _copy_weight(module, weight):
-            module.to_empty(device=device)
+        def _alias_weight(module, weight):
+            # Avoid a temporary 2x expert-memory spike during ModelOpt
+            # conversion. Streaming hooks later move these per-expert weights
+            # as independent tensors, so the storage alias is only transient.
             with torch.no_grad():
-                module.weight.data = weight.detach().data.to(dtype=dtype, device=device)
+                module._parameters["weight"] = nn.Parameter(
+                    weight.detach(), requires_grad=False
+                )
 
         with init_empty_weights():
             gate_proj = nn.ModuleList(
@@ -86,15 +95,23 @@ class _QuantFusedExperts(QuantModule):
             )
 
         for idx in range(self.num_experts):
-            _copy_weight(gate_proj[idx], self.gate_up_proj[idx, :I, :])
-            _copy_weight(up_proj[idx], self.gate_up_proj[idx, I:, :])
-            _copy_weight(down_proj[idx], self.down_proj[idx])
+            _alias_weight(gate_proj[idx], self.gate_up_proj[idx, :I, :])
+            _alias_weight(up_proj[idx], self.gate_up_proj[idx, I:, :])
+            _alias_weight(down_proj[idx], self.down_proj[idx])
 
         delattr(self, "gate_up_proj")
         delattr(self, "down_proj")
         self.gate_proj = gate_proj
         self.up_proj = up_proj
         self.down_proj = down_proj
+
+    def _apply_gate_up(self, gate, up):
+        if hasattr(self, "swiglu_alpha") and hasattr(self, "swiglu_limit"):
+            gate = gate.clamp(max=self.swiglu_limit)
+            up = up.clamp(min=-self.swiglu_limit, max=self.swiglu_limit)
+            glu = gate * torch.sigmoid(gate * self.swiglu_alpha)
+            return (up + 1.0) * glu
+        return self.act_fn(gate) * up
 
     def forward(self, hidden_states, top_k_index, top_k_weights):
         final_hidden_states = torch.zeros_like(hidden_states)
@@ -113,7 +130,7 @@ class _QuantFusedExperts(QuantModule):
             current_state = hidden_states[token_idx]
             gate = self.gate_proj[expert_idx](current_state)
             up = self.up_proj[expert_idx](current_state)
-            current_hidden_states = self.act_fn(gate) * up
+            current_hidden_states = self._apply_gate_up(gate, up)
             current_hidden_states = self.down_proj[expert_idx](current_hidden_states)
             current_hidden_states = current_hidden_states * top_k_weights[token_idx, top_k_pos, None]
             final_hidden_states.index_add_(
@@ -195,3 +212,40 @@ def register_qwen35_moe_for_quantization():
         )(_QuantFusedExperts)
 
     print("✓ Registered Qwen3.5 MoE for quantization")
+
+
+# ---------------------------------------------------------------------------
+# MiniMax M3-VL.
+# ---------------------------------------------------------------------------
+
+class _QuantMiniMaxM3VLSparseMoeBlock(_QuantSparseMoe):
+    @property
+    def num_experts(self):
+        return self.experts.num_experts
+
+    def forward(self, hidden_states):
+        return super(_QuantSparseMoe, self).forward(hidden_states)
+
+
+def register_minimax_m3_moe_for_quantization():
+    """Register MiniMax M3-VL routed MoE classes with modelopt."""
+    try:
+        from transformers.models.minimax_m3_vl.modeling_minimax_m3_vl import (
+            MiniMaxM3VLExperts,
+            MiniMaxM3VLSparseMoeBlock,
+        )
+    except ImportError:
+        print("⚠ minimax_m3_vl not in transformers, skipping MiniMax M3 registration")
+        return
+
+    if QuantModuleRegistry.get(MiniMaxM3VLSparseMoeBlock) is None:
+        QuantModuleRegistry.register(
+            {MiniMaxM3VLSparseMoeBlock: "MiniMaxM3VLSparseMoeBlock"}
+        )(_QuantMiniMaxM3VLSparseMoeBlock)
+
+    if QuantModuleRegistry.get(MiniMaxM3VLExperts) is None:
+        QuantModuleRegistry.register(
+            {MiniMaxM3VLExperts: "MiniMaxM3VLExperts"}
+        )(_QuantFusedExperts)
+
+    print("✓ Registered MiniMax M3 MoE for quantization")

@@ -7,6 +7,7 @@ import re
 import sys
 import tomllib
 from collections import defaultdict
+from collections.abc import Mapping
 from pathlib import Path
 
 import torch
@@ -58,12 +59,37 @@ parser.add_argument("--batch-tokens", type=int, default=128 * 1024,
                     help="Token budget for auto-computing batch_size when a dataset sets max_len.")
 parser.add_argument("--max-len", type=int, default=4096)
 parser.add_argument("--cpu-capacity", type=str, default="200GiB")
+parser.add_argument("--streaming-gpu-capacity", type=str, default=None,
+                    help="Streaming planner capacity for each storage GPU 1-N. Default: physical GPU memory.")
+parser.add_argument("--streaming-gpu0-storage-capacity", type=str, default="0GiB",
+                    help="Optional streaming layer-storage budget on execution GPU 0, e.g. 48GiB.")
 parser.add_argument("--save-amax", type=str, default=None,
                     help="Save calibration amax values to this safetensors file.")
 parser.add_argument("--skip-export", action="store_true",
                     help="Skip model export (amax-only calibration run).")
-parser.add_argument("--streaming", action="store_true", default=None,
-                    help="Force streaming loader. Default: use model config.")
+streaming_group = parser.add_mutually_exclusive_group()
+streaming_group.add_argument("--streaming", dest="streaming", action="store_true",
+                             help="Force streaming loader. Default: use model config.")
+streaming_group.add_argument("--no-streaming", dest="streaming", action="store_false",
+                             help="Disable streaming loader, overriding the model config.")
+parser.add_argument("--device-map", default=None,
+                    help="Transformers device_map for non-streaming loads. Defaults to sequential for MiniMax-M3, auto otherwise.")
+parser.add_argument("--max-memory-per-gpu", default=None,
+                    help="Optional Accelerate max_memory cap for every visible GPU, e.g. 88GiB.")
+parser.add_argument("--max-memory-cpu", default=None,
+                    help="Optional Accelerate max_memory cap for CPU offload, e.g. 256GiB.")
+parser.add_argument("--gpu-headroom-gib", type=float, default=None,
+                    help="GPU memory to leave free when deriving max_memory. Defaults to 7 GiB for MiniMax-M3.")
+parser.add_argument("--host-staged-device-moves", choices=["auto", "yes", "no"], default="auto",
+                    help="Stage cross-GPU moves through CPU. For streaming, auto enables this only with more than 9 visible GPUs.")
+parser.add_argument("--cuda-staging-device", default=None,
+                    help="For streaming, CUDA trampoline device used by --cuda-staging-source-device transfers to/from cuda:0, e.g. cuda:8.")
+parser.add_argument("--cuda-staging-source-device", default=None,
+                    help="Storage CUDA device whose transfers to/from cuda:0 should relay through --cuda-staging-device, e.g. cuda:9.")
+parser.add_argument("--cuda-staging-reserve", default="0GiB",
+                    help="Reduce the streaming planner capacity on --cuda-staging-device by this amount.")
+parser.add_argument("--attn-implementation", default="auto",
+                    help="Transformers attention backend. For MiniMax-M3, auto resolves to sdpa; use minimax_m3_flex to try the custom FlexAttention path.")
 parser.add_argument("--floor-amaxes", action="store_true",
                     help="Floor sparse expert amaxes to median/10 of their peer group.")
 parser.add_argument("--resume-amax", type=str, default=None,
@@ -74,6 +100,7 @@ parser.add_argument("--calib-method", default="max", choices=["max", "quantile"]
                     help="Calibration algorithm. 'quantile' uses P2 streaming quantile estimation.")
 parser.add_argument("--save-quantiles", type=str, default=None,
                     help="Save quantile estimates to this JSON file (quantile calibration only).")
+parser.set_defaults(streaming=None)
 args = parser.parse_args()
 
 
@@ -139,7 +166,19 @@ for i, ds in enumerate(calib_datasets):
 cfg = load_config(args.model)
 MODEL_ID = args.model_id or cfg.model_id
 TRUST_REMOTE = cfg.trust_remote_code
+PROCESSOR_TRUST_REMOTE = cfg.get_processor_trust_remote_code()
 use_streaming = args.streaming if args.streaming is not None else cfg.streaming
+ATTN_IMPLEMENTATION = None
+if args.attn_implementation != "auto":
+    ATTN_IMPLEMENTATION = args.attn_implementation
+elif args.model == "minimax_m3":
+    ATTN_IMPLEMENTATION = "sdpa"
+if ATTN_IMPLEMENTATION == "minimax_m3_flex":
+    from models.minimax_m3_flex import register_minimax_m3_flex_attention
+
+    register_minimax_m3_flex_attention()
+if ATTN_IMPLEMENTATION is not None:
+    print(f"Using attention implementation: {ATTN_IMPLEMENTATION}")
 
 cfg.register_moe()
 
@@ -153,7 +192,10 @@ if has_mm:
     from transformers import AutoProcessor
     from PIL import Image
     try:
-        processor = AutoProcessor.from_pretrained(MODEL_ID, trust_remote_code=TRUST_REMOTE)
+        processor = AutoProcessor.from_pretrained(
+            MODEL_ID,
+            trust_remote_code=PROCESSOR_TRUST_REMOTE,
+        )
         print(f"Loaded multimodal processor for {MODEL_ID}")
     except OSError:
         if args.model != "mimo_v25":
@@ -163,10 +205,89 @@ if has_mm:
 
 def _parse_gib(s):
     s = s.strip()
-    for suffix in ("GiB", "GB", "gib", "gb"):
+    for suffix in ("GiB", "gib"):
         if s.endswith(suffix):
             return float(s[: -len(suffix)])
+    for suffix in ("MiB", "mib"):
+        if s.endswith(suffix):
+            return float(s[: -len(suffix)]) / 1024
+    for suffix in ("GB", "gb"):
+        if s.endswith(suffix):
+            return float(s[: -len(suffix)]) * 1000**3 / 1024**3
+    for suffix in ("MB", "mb"):
+        if s.endswith(suffix):
+            return float(s[: -len(suffix)]) * 1000**2 / 1024**3
     return float(s)
+
+
+def _max_memory_map(per_gpu: str | None, cpu: str | None) -> dict | None:
+    max_memory = {}
+    if per_gpu is not None:
+        for idx in range(torch.cuda.device_count()):
+            max_memory[idx] = per_gpu
+    if cpu is not None:
+        max_memory["cpu"] = cpu
+    return max_memory or None
+
+
+def _default_per_gpu_memory(headroom_gib: float | None) -> str | None:
+    if args.model != "minimax_m3":
+        return None
+    if headroom_gib is None:
+        headroom_gib = 7.0
+    if not torch.cuda.is_available() or headroom_gib <= 0:
+        return None
+    total_gib = torch.cuda.get_device_properties(0).total_memory / 1024**3
+    usable_gib = max(1, int(total_gib - headroom_gib))
+    return f"{usable_gib}GiB"
+
+
+def _patch_accelerate_host_staged_device_moves():
+    try:
+        import accelerate.hooks as accelerate_hooks
+        from accelerate.utils import operations as accelerate_ops
+    except ImportError:
+        return
+
+    if getattr(accelerate_hooks, "_quantize_host_staged_send", False):
+        return
+
+    original_send_to_device = accelerate_ops.send_to_device
+
+    def host_staged_send_to_device(value, device, non_blocking=False, skip_keys=None):
+        target = torch.device(device) if not isinstance(device, torch.device) else device
+        if torch.is_tensor(value):
+            if value.device.type == "cuda" and target.type == "cuda" and value.device != target:
+                return value.to("cpu").to(target)
+            return original_send_to_device(value, device, non_blocking=non_blocking, skip_keys=skip_keys)
+        if isinstance(value, tuple):
+            return tuple(
+                host_staged_send_to_device(item, device, non_blocking=non_blocking, skip_keys=skip_keys)
+                for item in value
+            )
+        if isinstance(value, list):
+            return [
+                host_staged_send_to_device(item, device, non_blocking=non_blocking, skip_keys=skip_keys)
+                for item in value
+            ]
+        if isinstance(value, Mapping):
+            if isinstance(skip_keys, str):
+                skip = {skip_keys}
+            else:
+                skip = set(skip_keys or [])
+            return type(value)(
+                {
+                    key: item
+                    if key in skip
+                    else host_staged_send_to_device(item, device, non_blocking=non_blocking, skip_keys=skip_keys)
+                    for key, item in value.items()
+                }
+            )
+        return value
+
+    accelerate_ops.send_to_device = host_staged_send_to_device
+    accelerate_hooks.send_to_device = host_staged_send_to_device
+    accelerate_hooks._quantize_host_staged_send = True
 
 
 model_cls = cfg.get_model_cls()
@@ -175,11 +296,37 @@ if use_streaming:
     from streaming_loader import StreamingModelLoader
 
     print(f"Loading model from {MODEL_ID} with streaming loader...")
+    streaming_cuda_staging_device = args.cuda_staging_device
+    streaming_host_stage_moves = args.host_staged_device_moves == "yes" or (
+        args.host_staged_device_moves == "auto"
+        and torch.cuda.device_count() > 9
+        and streaming_cuda_staging_device is None
+    )
+    if streaming_cuda_staging_device is not None:
+        if args.cuda_staging_source_device:
+            print(
+                "Using CUDA-staged streaming layer moves "
+                f"{args.cuda_staging_source_device} -> {streaming_cuda_staging_device} -> cuda:0"
+            )
+        else:
+            print(f"Using CUDA-staged streaming layer moves through {streaming_cuda_staging_device}")
+    if streaming_host_stage_moves:
+        print("Using host-staged streaming layer moves")
     loader = StreamingModelLoader(
         model_id=MODEL_ID,
         dtype=torch.bfloat16,
         trust_remote_code=TRUST_REMOTE,
+        gpu_capacity_gib=(
+            _parse_gib(args.streaming_gpu_capacity)
+            if args.streaming_gpu_capacity is not None else None
+        ),
+        gpu0_storage_capacity_gib=_parse_gib(args.streaming_gpu0_storage_capacity),
         cpu_capacity_gib=_parse_gib(args.cpu_capacity),
+        host_staged_device_moves=streaming_host_stage_moves,
+        attention_implementation=ATTN_IMPLEMENTATION,
+        cuda_staging_device=streaming_cuda_staging_device,
+        cuda_staging_source_device=args.cuda_staging_source_device,
+        cuda_staging_reserve_gib=_parse_gib(args.cuda_staging_reserve),
     )
     model = loader.load_model(model_cls=model_cls)
 else:
@@ -188,12 +335,34 @@ else:
     print(f"Loading model from {MODEL_ID} onto GPUs...")
     loader = None
     cls = model_cls or AutoModelForCausalLM
+    device_map = args.device_map or ("sequential" if args.model == "minimax_m3" else "auto")
+    model_kwargs = {
+        "torch_dtype": torch.bfloat16,
+        "trust_remote_code": TRUST_REMOTE,
+        "device_map": device_map,
+    }
+    if ATTN_IMPLEMENTATION is not None:
+        model_kwargs["attn_implementation"] = ATTN_IMPLEMENTATION
+    per_gpu_memory = args.max_memory_per_gpu or _default_per_gpu_memory(args.gpu_headroom_gib)
+    max_memory = _max_memory_map(per_gpu_memory, args.max_memory_cpu)
+    if max_memory is not None:
+        model_kwargs["max_memory"] = max_memory
+        print(f"Using max_memory={max_memory}")
+    host_stage_moves = args.host_staged_device_moves == "yes" or (
+        args.host_staged_device_moves == "auto" and args.model == "minimax_m3"
+    )
+    if host_stage_moves:
+        _patch_accelerate_host_staged_device_moves()
+        print("Using host-staged cross-GPU activation moves")
+    print(f"Using device_map={device_map}")
     model = cls.from_pretrained(
         MODEL_ID,
-        torch_dtype=torch.bfloat16,
-        trust_remote_code=TRUST_REMOTE,
-        device_map="auto",
+        **model_kwargs,
     )
+if args.model == "minimax_m3" and ATTN_IMPLEMENTATION is not None:
+    from models.minimax_m3_flex import assert_attention_implementation
+
+    assert_attention_implementation(model, ATTN_IMPLEMENTATION)
 
 if has_mm and processor is None and getattr(getattr(model, "config", None), "model_type", None) == "mimo_v2":
     processor = build_mimo_processor(tokenizer, model.config)
@@ -282,7 +451,7 @@ def _tokenize_batch(texts, max_len):
         })
     if processor is not None:
         batch = processor(**kwargs)
-        batch = normalize_processor_inputs(batch)
+        batch = _normalize_processor_batch(batch)
         # Text-only batches need explicit position_ids to bypass the VL
         # model's compute_3d_position_ids, which fails without image tokens.
         if not _has_visual_inputs(batch):
@@ -334,12 +503,45 @@ def _apply_mm_chat_template(messages):
 def _has_visual_inputs(batch):
     return any(
         key in batch
-        for key in ("pixel_values", "image_embeds", "video_pixel_values", "video_embeds")
+        for key in (
+            "pixel_values",
+            "image_embeds",
+            "pixel_values_videos",
+            "video_pixel_values",
+            "video_embeds",
+        )
     )
 
 
 def _is_mimo_v2_model():
     return getattr(getattr(model, "config", None), "model_type", None) == "mimo_v2"
+
+
+def _is_minimax_m3_vl_model():
+    return getattr(getattr(model, "config", None), "model_type", None) == "minimax_m3_vl"
+
+
+def _normalize_processor_batch(batch):
+    if _is_mimo_v2_model():
+        return normalize_processor_inputs(batch)
+    return batch
+
+
+def _video_processor_kwargs():
+    if _is_mimo_v2_model():
+        return mimo_video_processor_kwargs()
+    if _is_minimax_m3_vl_model():
+        # The published M3 processor merges video kwargs with do_resize=False,
+        # but its patch packing requires H/W to be aligned to patch*merge.
+        # It also uses every frame for path inputs unless sampling is enabled,
+        # which can create huge video prompts that are easy to truncate.
+        return {
+            "do_resize": True,
+            "do_sample_frames": True,
+            "fps": 0.5,
+            "max_pixels": 224 * 224,
+        }
+    return {}
 
 
 def _config_value(name, default=None):
@@ -487,7 +689,7 @@ def iter_mm_samples(path, limit=None):
                         if video_path:
                             resolved_video_path = _resolve_media_path(video_path, path)
                             videos.append(resolved_video_path)
-                            if video_uses_audio(part, resolved_video_path):
+                            if _is_mimo_v2_model() and video_uses_audio(part, resolved_video_path):
                                 audio_ref = video_audio_source(part, resolved_video_path)
                                 audio_part = {"type": "audio", "audio": audio_ref}
                                 audio = _prepare_audio_part(audio_part, path)
@@ -540,9 +742,9 @@ def build_mm_batches(samples, max_len, batch_size):
             kwargs["images"] = buf_images
         if buf_videos:
             kwargs["videos"] = buf_videos
-            kwargs.update(mimo_video_processor_kwargs())
+            kwargs.update(_video_processor_kwargs())
         batch = processor(**kwargs)
-        batch = normalize_processor_inputs(batch)
+        batch = _normalize_processor_batch(batch)
         if _is_mimo_v2_model() and buf_images:
             replace_mimo_image_pixels(batch, buf_images, model.config)
         if buf_audio_codes:
@@ -690,10 +892,25 @@ _MIMO_ALLOWED_QUANTIZER_RE = re.compile(
     r"(?:gate_proj|up_proj|down_proj)\.(?:weight_quantizer|input_quantizer)$"
 )
 
+_MINIMAX_M3_ALLOWED_QUANTIZER_RE = re.compile(
+    r"^model\.language_model\.layers\.\d+\.mlp\.experts\."
+    r"(?:gate_proj|up_proj|down_proj)\.\d+\."
+    r"(?:weight_quantizer|input_quantizer)$"
+)
 
-def _validate_mimo_enabled_quantizers(m):
-    if args.model != "mimo_v25":
+def _validate_enabled_quantizers(m):
+    allowed_re = None
+    label = None
+    if args.model == "mimo_v25":
+        allowed_re = _MIMO_ALLOWED_QUANTIZER_RE
+        label = "MiMo"
+    elif args.model == "minimax_m3":
+        allowed_re = _MINIMAX_M3_ALLOWED_QUANTIZER_RE
+        label = "MiniMax M3"
+
+    if allowed_re is None:
         return
+
     enabled = []
     bad = []
     for name, mod in m.named_modules():
@@ -702,18 +919,18 @@ def _validate_mimo_enabled_quantizers(m):
             continue
         if bool(is_enabled):
             enabled.append(name)
-            if not _MIMO_ALLOWED_QUANTIZER_RE.match(name):
+            if not allowed_re.match(name):
                 bad.append(name)
 
     if bad:
         sample = "\n    ".join(bad[:32])
         raise RuntimeError(
-            "MiMo quantization is configured for routed expert MLPs only, "
+            f"{label} quantization is configured for routed expert MLPs only, "
             f"but found {len(bad)} enabled non-expert quantizer(s):\n    {sample}"
         )
     if not enabled:
-        raise RuntimeError("MiMo quantization has no enabled routed expert MLP quantizers")
-    print(f"  MiMo enabled quantizers: {len(enabled)} routed expert MLP quantizer(s)")
+        raise RuntimeError(f"{label} quantization has no enabled routed expert MLP quantizers")
+    print(f"  {label} enabled quantizers: {len(enabled)} routed expert MLP quantizer(s)")
 
 
 def _override_quantile_levels(m):
@@ -736,7 +953,7 @@ def forward_loop(m):
     input_device = next(m.parameters()).device
     resume = args.resume_batch
 
-    _validate_mimo_enabled_quantizers(m)
+    _validate_enabled_quantizers(m)
     _override_quantile_levels(m)
 
     if args.resume_amax:

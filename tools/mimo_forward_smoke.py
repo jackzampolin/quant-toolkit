@@ -1,16 +1,17 @@
 #!/usr/bin/env python3
-"""Run a simple MiMo generation smoke test."""
+"""Run a simple generation smoke test."""
 
 import argparse
 import json
 import os
 import sys
+from collections.abc import Mapping
 from pathlib import Path
 
 import torch
 import torch.nn.functional as F
 from PIL import Image
-from transformers import AutoProcessor, AutoTokenizer
+from transformers import AutoConfig, AutoModelForCausalLM, AutoProcessor, AutoTokenizer
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
@@ -131,7 +132,53 @@ def _print_preprocess_stats(stage: str, **values):
             stats.append({"name": name, "value": value})
         elif isinstance(value, (list, tuple)):
             stats.append({"name": name, "len": len(value), "head": _jsonable(value[:16])})
-    print(f"[MiMo preprocess stats] {stage}: {json.dumps(stats)}", file=sys.stderr)
+    print(f"[forward smoke preprocess stats] {stage}: {json.dumps(stats)}", file=sys.stderr)
+
+
+def _model_type(model_config) -> str | None:
+    return getattr(model_config, "model_type", None)
+
+
+def _is_mimo_model(model_config) -> bool:
+    return _model_type(model_config) == "mimo_v2"
+
+
+def _is_minimax_m3_model(model_config) -> bool:
+    return _model_type(model_config) == "minimax_m3_vl"
+
+
+def _modal_token_id(model_config, kind: str):
+    for name in (f"{kind}_token_id", f"{kind}_token_index"):
+        value = getattr(model_config, name, None)
+        if value is not None:
+            return value
+        value = processor_config_value(model_config, name)
+        if value is not None:
+            return value
+    return None
+
+
+def _video_processor_kwargs(model_config) -> dict:
+    if _is_mimo_model(model_config):
+        return mimo_video_processor_kwargs()
+    if _is_minimax_m3_model(model_config):
+        # MiniMax-M3's published processor currently merges do_resize=False,
+        # but its patch packing needs H/W aligned to patch_size*merge_size.
+        # It also defaults to using every frame for path inputs, which can
+        # expand a short clip into tens of thousands of video tokens.
+        return {
+            "do_resize": True,
+            "do_sample_frames": True,
+            "fps": 0.5,
+            "max_pixels": 224 * 224,
+        }
+    return {}
+
+
+def _normalize_processor_batch(batch, model_config):
+    if _is_mimo_model(model_config):
+        return normalize_processor_inputs(batch)
+    return batch
 
 
 def _mm_token_offsets(input_ids: torch.Tensor, token_id: int) -> list[tuple[int, int]]:
@@ -258,6 +305,76 @@ def _input_device(model):
     return torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
 
+def _max_memory_map(per_gpu: str | None, cpu: str | None) -> dict | None:
+    max_memory = {}
+    if per_gpu is not None:
+        for idx in range(torch.cuda.device_count()):
+            max_memory[idx] = per_gpu
+    if cpu is not None:
+        max_memory["cpu"] = cpu
+    return max_memory or None
+
+
+def _default_per_gpu_memory(model_config, headroom_gib: float | None) -> str | None:
+    if headroom_gib is None:
+        if not _is_minimax_m3_model(model_config):
+            return None
+        headroom_gib = 7.0
+    if not torch.cuda.is_available() or headroom_gib <= 0:
+        return None
+    total_gib = torch.cuda.get_device_properties(0).total_memory / 1024**3
+    usable_gib = max(1, int(total_gib - headroom_gib))
+    return f"{usable_gib}GiB"
+
+
+def _patch_accelerate_host_staged_device_moves():
+    try:
+        import accelerate.hooks as accelerate_hooks
+        from accelerate.utils import operations as accelerate_ops
+    except ImportError:
+        return
+
+    if getattr(accelerate_hooks, "_mimo_smoke_host_staged_send", False):
+        return
+
+    original_send_to_device = accelerate_ops.send_to_device
+
+    def host_staged_send_to_device(value, device, non_blocking=False, skip_keys=None):
+        target = torch.device(device) if not isinstance(device, torch.device) else device
+        if torch.is_tensor(value):
+            if value.device.type == "cuda" and target.type == "cuda" and value.device != target:
+                return value.to("cpu").to(target)
+            return original_send_to_device(value, device, non_blocking=non_blocking, skip_keys=skip_keys)
+        if isinstance(value, tuple):
+            return tuple(
+                host_staged_send_to_device(item, device, non_blocking=non_blocking, skip_keys=skip_keys)
+                for item in value
+            )
+        if isinstance(value, list):
+            return [
+                host_staged_send_to_device(item, device, non_blocking=non_blocking, skip_keys=skip_keys)
+                for item in value
+            ]
+        if isinstance(value, Mapping):
+            if isinstance(skip_keys, str):
+                skip = {skip_keys}
+            else:
+                skip = set(skip_keys or [])
+            return type(value)(
+                {
+                    key: item
+                    if key in skip
+                    else host_staged_send_to_device(item, device, non_blocking=non_blocking, skip_keys=skip_keys)
+                    for key, item in value.items()
+                }
+            )
+        return value
+
+    accelerate_ops.send_to_device = host_staged_send_to_device
+    accelerate_hooks.send_to_device = host_staged_send_to_device
+    accelerate_hooks._mimo_smoke_host_staged_send = True
+
+
 def _zero_known_mimo_missing_biases(model):
     names = [
         "visual.merger.mlp.0.bias",
@@ -360,6 +477,7 @@ def _prepare_prompt(
             "image_grid_thw": None,
             "image_embeds": None,
             "video_pixel_values": None,
+            "pixel_values_videos": None,
             "video_grid_thw": None,
             "video_embeds": None,
             "audio_codes": audio_codes.to(device) if audio_codes is not None else None,
@@ -380,11 +498,11 @@ def _prepare_prompt(
         processor_kwargs["images"] = images
     if videos is not None:
         processor_kwargs["videos"] = videos
-        processor_kwargs.update(mimo_video_processor_kwargs())
+        processor_kwargs.update(_video_processor_kwargs(model_config))
     batch = processor(**processor_kwargs)
-    batch = normalize_processor_inputs(batch)
+    batch = _normalize_processor_batch(batch, model_config)
 
-    if images is not None:
+    if images is not None and _is_mimo_model(model_config):
         pixel_values, image_grid_thw = mimo_image_pixel_values(images[0], model_config)
         if "image_grid_thw" in batch and not torch.equal(batch["image_grid_thw"].cpu().to(image_grid_thw.dtype), image_grid_thw):
             raise ValueError(
@@ -415,16 +533,19 @@ def _prepare_prompt(
                 image_offsets=_mm_token_offsets(batch["input_ids"], int(image_token_id)),
             )
         if videos is not None:
+            video_values = batch.get("video_pixel_values")
+            if video_values is None:
+                video_values = batch.get("pixel_values_videos")
             _print_preprocess_stats(
                 "processor.video",
-                video_pixel_values=batch.get("video_pixel_values"),
+                video_pixel_values=video_values,
                 video_grid_thw=batch.get("video_grid_thw"),
                 video_offsets=_mm_token_offsets(batch["input_ids"], int(video_token_id)),
             )
     batch = _move_to_device(batch, device)
     image_embeds = None
     video_embeds = None
-    if images is not None:
+    if images is not None and _is_mimo_model(model_config):
         image_embeds = compute_mimo_visual_embeds(
             model_id=model_id,
             model_config=model_config,
@@ -433,7 +554,7 @@ def _prepare_prompt(
             device=device,
             log_file=sys.stderr,
         )
-    if videos is not None:
+    if videos is not None and _is_mimo_model(model_config):
         if "video_pixel_values" not in batch or "video_grid_thw" not in batch:
             raise ValueError("Video preprocessing did not produce video_pixel_values and video_grid_thw")
         video_embeds = compute_mimo_visual_embeds(
@@ -453,12 +574,16 @@ def _prepare_prompt(
             )
             _print_preprocess_stats("model.image_embeds", image_embeds=image_embeds)
         if videos is not None:
+            video_values = batch.get("video_pixel_values")
+            if video_values is None:
+                video_values = batch.get("pixel_values_videos")
             _print_preprocess_stats(
                 "model.video",
-                video_pixel_values=batch["video_pixel_values"].to(dtype=torch.bfloat16),
+                video_pixel_values=video_values.to(dtype=torch.bfloat16),
                 video_grid_thw=batch["video_grid_thw"],
             )
-            _print_preprocess_stats("model.video_embeds", video_embeds=video_embeds)
+            if video_embeds is not None:
+                _print_preprocess_stats("model.video_embeds", video_embeds=video_embeds)
 
     return {
         "input_ids": batch["input_ids"],
@@ -467,6 +592,7 @@ def _prepare_prompt(
         "image_grid_thw": batch.get("image_grid_thw"),
         "image_embeds": image_embeds,
         "video_pixel_values": batch.get("video_pixel_values"),
+        "pixel_values_videos": batch.get("pixel_values_videos"),
         "video_grid_thw": batch.get("video_grid_thw"),
         "video_embeds": video_embeds,
         "audio_codes": audio_codes.to(device) if audio_codes is not None else None,
@@ -490,6 +616,9 @@ def _add_prefill_modal_inputs(model_inputs: dict, prompt: dict) -> None:
         model_inputs["video_embeds"] = prompt["video_embeds"]
     elif prompt.get("video_pixel_values") is not None:
         model_inputs["video_pixel_values"] = prompt["video_pixel_values"]
+        model_inputs["video_grid_thw"] = prompt["video_grid_thw"]
+    elif prompt.get("pixel_values_videos") is not None:
+        model_inputs["pixel_values_videos"] = prompt["pixel_values_videos"]
         model_inputs["video_grid_thw"] = prompt["video_grid_thw"]
     if prompt.get("audio_codes") is not None:
         model_inputs["audio_codes"] = prompt["audio_codes"]
@@ -670,8 +799,8 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("prompt", nargs="?", default="Explain why large language model checkpoint integrity matters.")
     parser.add_argument("--model", default="mimo_v25", help="Repo model config name.")
-    parser.add_argument("--model-id", default="/data/models/MiMo-V2.5-BF16-qkv-deinterleaved",
-                        help="HF model id or local checkpoint path.")
+    parser.add_argument("--model-id", default=None,
+                        help="HF model id or local checkpoint path. Defaults to the selected repo model config.")
     parser.add_argument("--image", default=None, help="Optional image path to include in the user message.")
     parser.add_argument("--video", default=None, help="Optional video path to include in the user message.")
     parser.add_argument("--video-use-audio", choices=["auto", "yes", "no"], default="auto",
@@ -682,11 +811,40 @@ def main():
                         help="Optional path to MiMo's audio_tokenizer sidecar directory.")
     parser.add_argument("--max-input-tokens", type=int, default=4096)
     parser.add_argument("--max-new-tokens", type=int, default=128)
+    streaming_group = parser.add_mutually_exclusive_group()
+    streaming_group.add_argument("--streaming", dest="streaming", action="store_true",
+                                 help="Force the repo streaming/offload loader.")
+    streaming_group.add_argument("--no-streaming", dest="streaming", action="store_false",
+                                 help="Disable the repo streaming/offload loader.")
+    parser.set_defaults(streaming=None)
     parser.add_argument("--decode-mode", choices=["full", "kv-cache", "compare-cache"], default="full",
                         help="Generation loop to use. compare-cache prints cached-vs-full logits stats to stderr.")
-    parser.add_argument("--device-map", default="auto")
+    parser.add_argument("--device-map", default=None,
+                        help="Transformers device_map for non-streaming loads. Defaults to sequential for MiniMax-M3, auto otherwise.")
+    parser.add_argument("--cpu-capacity", type=str, default="200GiB",
+                        help="CPU layer-storage budget for the streaming loader.")
+    parser.add_argument("--streaming-gpu-capacity", type=str, default=None,
+                        help="Streaming planner capacity for each storage GPU 1-N. Default: physical GPU memory.")
+    parser.add_argument("--streaming-gpu0-storage-capacity", type=str, default="0GiB",
+                        help="Optional streaming layer-storage budget on execution GPU 0.")
+    parser.add_argument("--cuda-staging-device", default=None,
+                        help="For streaming, CUDA trampoline device for transfers to/from cuda:0, e.g. cuda:8.")
+    parser.add_argument("--cuda-staging-source-device", default=None,
+                        help="Storage CUDA device whose transfers should relay through --cuda-staging-device, e.g. cuda:9.")
+    parser.add_argument("--cuda-staging-reserve", default="0GiB",
+                        help="Reduce streaming planner capacity on --cuda-staging-device by this amount.")
+    parser.add_argument("--max-memory-per-gpu", default=None,
+                        help="Optional Accelerate max_memory cap for every visible GPU, e.g. 84GiB.")
+    parser.add_argument("--max-memory-cpu", default=None,
+                        help="Optional Accelerate max_memory cap for CPU offload, e.g. 256GiB.")
+    parser.add_argument("--offload-folder", default=None,
+                        help="Optional folder for Accelerate disk offload.")
+    parser.add_argument("--gpu-headroom-gib", type=float, default=None,
+                        help="GPU memory to leave free when deriving max_memory. Defaults to 7 GiB for MiniMax-M3.")
+    parser.add_argument("--host-staged-device-moves", choices=["auto", "yes", "no"], default="auto",
+                        help="Stage cross-GPU activation moves through CPU. Defaults to auto, enabled for MiniMax-M3.")
     parser.add_argument("--attn-implementation", default="auto",
-                        help="Transformers attention backend override. Defaults to auto, which omits the override.")
+                        help="Transformers attention backend. For MiniMax-M3, auto resolves to sdpa; use minimax_m3_flex to try the custom FlexAttention path.")
     parser.add_argument("--visual-qkv-layout", choices=["canonical", "grouped"], default="canonical",
                         help="How visual attn.qkv rows are stored on disk before the vendored model splits Q/K/V.")
     parser.add_argument("--vision-attn-ablation", choices=["correct", "full-no-sinks"], default="correct",
@@ -702,14 +860,43 @@ def main():
 
     torch.manual_seed(args.seed)
     cfg = load_config(args.model)
+    model_id = args.model_id or cfg.model_id
     trust_remote = cfg.trust_remote_code
+    processor_trust_remote = cfg.get_processor_trust_remote_code()
+    use_streaming = args.streaming if args.streaming is not None else cfg.streaming
 
     model_cls = cfg.get_model_cls()
-    cls = model_cls
-    model_config = cls.config_class.from_pretrained(args.model_id)
+    cls = model_cls or AutoModelForCausalLM
+    if model_cls is None:
+        model_config = AutoConfig.from_pretrained(
+            model_id,
+            trust_remote_code=trust_remote,
+        )
+    else:
+        model_config = cls.config_class.from_pretrained(
+            model_id,
+            trust_remote_code=trust_remote,
+        )
+    attn_implementation = None
+    if args.attn_implementation != "auto":
+        attn_implementation = args.attn_implementation
+    elif _is_minimax_m3_model(model_config):
+        attn_implementation = "sdpa"
+    if attn_implementation == "minimax_m3_flex":
+        from models.minimax_m3_flex import register_minimax_m3_flex_attention
+
+        register_minimax_m3_flex_attention()
+    if attn_implementation is not None:
+        print(f"Using attention implementation: {attn_implementation}", file=sys.stderr)
+    if _is_minimax_m3_model(model_config) and os.environ.get("PYTORCH_NO_CUDA_MEMORY_CACHING") != "1":
+        print(
+            "Warning: MiniMax-M3 full-checkpoint conversion may OOM unless "
+            "PYTORCH_NO_CUDA_MEMORY_CACHING=1 is set before launching Python.",
+            file=sys.stderr,
+        )
 
     tokenizer = AutoTokenizer.from_pretrained(
-        args.model_id,
+        model_id,
         trust_remote_code=trust_remote,
         config=model_config,
     )
@@ -721,57 +908,133 @@ def main():
     if args.image is not None or args.video is not None:
         try:
             processor = AutoProcessor.from_pretrained(
-                args.model_id,
-                trust_remote_code=trust_remote,
+                model_id,
+                trust_remote_code=processor_trust_remote,
                 config=model_config,
             )
         except OSError:
+            if not _is_mimo_model(model_config):
+                raise
             processor = build_mimo_processor(tokenizer, model_config)
         if getattr(processor, "chat_template", None) is None:
             processor.chat_template = tokenizer.chat_template
 
-    no_split = ["MiMoV2DecoderLayer", "MiMoV2MoE"]
-    existing = list(getattr(cls, "_no_split_modules", []) or [])
-    cls._no_split_modules = sorted(set(existing + no_split))
-    model_kwargs = {
-        "config": model_config,
-        "torch_dtype": torch.bfloat16,
-        "trust_remote_code": trust_remote,
-        "device_map": args.device_map,
-    }
-    if args.attn_implementation != "auto":
-        model_kwargs["attn_implementation"] = args.attn_implementation
-    model = cls.from_pretrained(
-        args.model_id,
-        **model_kwargs,
-    )
-    _zero_known_mimo_missing_biases(model)
-    _normalize_visual_qkv_layout(model, model_config, args.visual_qkv_layout)
-    _apply_vision_attention_ablation(model, args.vision_attn_ablation)
+    cfg.register_moe()
+
+    if use_streaming:
+        from streaming_loader import StreamingModelLoader, _parse_gib
+
+        streaming_cuda_staging_device = args.cuda_staging_device
+        streaming_host_stage_moves = args.host_staged_device_moves == "yes" or (
+            args.host_staged_device_moves == "auto"
+            and torch.cuda.device_count() > 9
+            and streaming_cuda_staging_device is None
+        )
+        print(f"Loading model from {model_id} with streaming loader...", file=sys.stderr)
+        if streaming_cuda_staging_device is not None:
+            if args.cuda_staging_source_device:
+                print(
+                    "Using CUDA-staged streaming layer moves "
+                    f"{args.cuda_staging_source_device} -> {streaming_cuda_staging_device} -> cuda:0",
+                    file=sys.stderr,
+                )
+            else:
+                print(
+                    f"Using CUDA-staged streaming layer moves through {streaming_cuda_staging_device}",
+                    file=sys.stderr,
+                )
+        if streaming_host_stage_moves:
+            print("Using host-staged streaming layer moves", file=sys.stderr)
+        loader = StreamingModelLoader(
+            model_id=model_id,
+            dtype=torch.bfloat16,
+            trust_remote_code=trust_remote,
+            gpu_capacity_gib=(
+                _parse_gib(args.streaming_gpu_capacity)
+                if args.streaming_gpu_capacity is not None else None
+            ),
+            gpu0_storage_capacity_gib=_parse_gib(args.streaming_gpu0_storage_capacity),
+            cpu_capacity_gib=_parse_gib(args.cpu_capacity),
+            host_staged_device_moves=streaming_host_stage_moves,
+            attention_implementation=attn_implementation,
+            cuda_staging_device=streaming_cuda_staging_device,
+            cuda_staging_source_device=args.cuda_staging_source_device,
+            cuda_staging_reserve_gib=_parse_gib(args.cuda_staging_reserve),
+        )
+        model = loader.load_model(model_cls=model_cls)
+    else:
+        if _is_mimo_model(model_config):
+            no_split = ["MiMoV2DecoderLayer", "MiMoV2MoE"]
+            existing = list(getattr(cls, "_no_split_modules", []) or [])
+            cls._no_split_modules = sorted(set(existing + no_split))
+        device_map = args.device_map or ("sequential" if _is_minimax_m3_model(model_config) else "auto")
+        print(f"Using device_map={device_map}", file=sys.stderr)
+        model_kwargs = {
+            "config": model_config,
+            "torch_dtype": torch.bfloat16,
+            "trust_remote_code": trust_remote,
+            "device_map": device_map,
+        }
+        per_gpu_memory = args.max_memory_per_gpu or _default_per_gpu_memory(
+            model_config,
+            args.gpu_headroom_gib,
+        )
+        max_memory = _max_memory_map(per_gpu_memory, args.max_memory_cpu)
+        if max_memory is not None:
+            model_kwargs["max_memory"] = max_memory
+            print(f"Using max_memory={max_memory}", file=sys.stderr)
+        if args.offload_folder is not None:
+            model_kwargs["offload_folder"] = args.offload_folder
+        if attn_implementation is not None:
+            model_kwargs["attn_implementation"] = attn_implementation
+        host_stage_moves = args.host_staged_device_moves == "yes" or (
+            args.host_staged_device_moves == "auto" and _is_minimax_m3_model(model_config)
+        )
+        if host_stage_moves:
+            _patch_accelerate_host_staged_device_moves()
+            print("Using host-staged cross-GPU activation moves", file=sys.stderr)
+        model = cls.from_pretrained(
+            model_id,
+            **model_kwargs,
+        )
+    if _is_minimax_m3_model(model_config) and attn_implementation is not None:
+        from models.minimax_m3_flex import assert_attention_implementation
+
+        assert_attention_implementation(model, attn_implementation)
+    if _is_mimo_model(model_config):
+        _zero_known_mimo_missing_biases(model)
+        _normalize_visual_qkv_layout(model, model_config, args.visual_qkv_layout)
+        _apply_vision_attention_ablation(model, args.vision_attn_ablation)
     model.eval()
 
     audio_paths = []
-    if args.video is not None:
+    if _is_mimo_model(model_config) and args.video is not None:
         video_path = str(Path(args.video).expanduser())
         if args.video_use_audio == "yes":
             audio_paths.append(video_path)
         elif args.video_use_audio == "auto" and has_audio_track(video_path):
             audio_paths.append(video_path)
-    if args.audio == "__default__":
-        audio_paths.append(_resolve_default_audio_path())
-    elif args.audio is not None:
-        audio_paths.append(args.audio)
+    if args.audio is not None:
+        if not _is_mimo_model(model_config):
+            raise ValueError(f"{args.model} does not support audio inputs in this smoke script")
+        if args.audio == "__default__":
+            audio_paths.append(_resolve_default_audio_path())
+        else:
+            audio_paths.append(args.audio)
 
     device = _input_device(model)
-    audio_codes, audio_counts = prepare_audio_codes(
-        model=model,
-        model_config=model_config,
-        model_id=args.model_id,
-        audio_paths=audio_paths,
-        audio_tokenizer_dir=args.audio_tokenizer_dir,
-        device=device,
-        log_fn=_print_preprocess_stats if args.log_preprocess_stats else None,
-    )
+    if _is_mimo_model(model_config):
+        audio_codes, audio_counts = prepare_audio_codes(
+            model=model,
+            model_config=model_config,
+            model_id=model_id,
+            audio_paths=audio_paths,
+            audio_tokenizer_dir=args.audio_tokenizer_dir,
+            device=device,
+            log_fn=_print_preprocess_stats if args.log_preprocess_stats else None,
+        )
+    else:
+        audio_codes, audio_counts = None, []
 
     messages = _build_messages(args.prompt, args.image, args.video, audio_paths)
     prompt_text = _build_prompt(prompt_renderer, messages, args.enable_thinking)
@@ -790,7 +1053,7 @@ def main():
         max_input_tokens=args.max_input_tokens,
         device=device,
         log_preprocess_stats=args.log_preprocess_stats,
-        model_id=args.model_id,
+        model_id=model_id,
     )
     if args.log_preprocess_stats:
         _log_local_backbone_input_stats(model, prompt, model_config)

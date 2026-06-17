@@ -1,0 +1,31 @@
+# Calibration datasets for MiniMax M3.
+# Mirrors MiMo-V2.5 coverage, but omits audio because M3 has no audio tower.
+# M3 quantization currently targets routed language experts only; the vision
+# tower/projector/attention/shared experts are disabled in the model recipe.
+
+[[dataset]]
+path = "text/agentic_coding_calib_v3.jsonl"
+max_len = 1024
+limit = 4096
+
+[[dataset]]
+path = "multimodal/vqa_calib.jsonl"
+batch_size = 64
+limit = 256
+multimodal = true
+
+[[dataset]]
+path = "/data/datasets/multimodal/video/finevideo_calib.jsonl"
+batch_size = 8
+limit = 64
+multimodal = true
+
+[[dataset]]
+path = "text/diverse_calib.jsonl"
+max_len = 1024
+limit = 1024
+
+[[dataset]]
+path = "text/deep_calib.jsonl"
+max_len = 8192
+limit = 512
