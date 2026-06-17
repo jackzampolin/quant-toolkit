@@ -458,17 +458,30 @@ class ShardWriter:
         self.out = out
         self.target_shard_size = target_shard_size
         self.current_tensors: dict[str, torch.Tensor] = {}
+        self.current_storage_keys: dict[tuple[str, int], str] = {}
         self.current_size = 0
         self.shard_idx = 0
         self.output_weight_map: dict[str, str] = {}
         self.written: list[tuple[str, int, int]] = []
+
+    @staticmethod
+    def _storage_key(tensor: torch.Tensor) -> tuple[str, int] | None:
+        if tensor.device.type == "meta" or tensor.numel() == 0:
+            return None
+        return str(tensor.device), tensor.untyped_storage().data_ptr()
 
     def add(self, key: str, tensor: torch.Tensor) -> None:
         tensor = tensor.contiguous()
         size = tensor_nbytes(tensor)
         if self.current_tensors and self.current_size + size > self.target_shard_size:
             self.flush()
+        storage_key = self._storage_key(tensor)
+        if storage_key is not None and storage_key in self.current_storage_keys:
+            tensor = tensor.clone()
+            storage_key = self._storage_key(tensor)
         self.current_tensors[key] = tensor
+        if storage_key is not None:
+            self.current_storage_keys[storage_key] = key
         self.current_size += size
 
     def flush(self) -> None:
@@ -487,6 +500,7 @@ class ShardWriter:
             flush=True,
         )
         self.current_tensors = {}
+        self.current_storage_keys = {}
         self.current_size = 0
         gc.collect()
 
