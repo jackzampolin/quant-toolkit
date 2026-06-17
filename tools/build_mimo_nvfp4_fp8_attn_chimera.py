@@ -23,6 +23,12 @@ import torch
 from safetensors import safe_open
 from safetensors.torch import save_file
 
+from mimo_qkv_formats import (
+    FP8_PB_WEIGHT_BLOCK_SIZE,
+    MXFP8_WEIGHT_BLOCK_SIZE,
+    infer_qkv_quant_format,
+)
+
 
 DEFAULT_BASE = Path("/data/models/MiMo-V2.5-NVFP4-w13-tied")
 DEFAULT_FP8 = Path("/data/models/MiMo-V2.5-FP8-qkv-deinterleaved")
@@ -30,8 +36,6 @@ DEFAULT_OUTPUT = Path("/data/models/MiMo-V2.5-NVFP4-w13-tied-FP8-attn")
 INDEX_NAME = "model.safetensors.index.json"
 LANGUAGE_QKV_RE = re.compile(r"^model\.layers\.\d+\.self_attn\.qkv_proj\.weight$")
 MTP_QKV_RE = re.compile(r"^model\.mtp\.layers\.\d+\.self_attn\.qkv_proj\.weight$")
-FP8_PB_WEIGHT_BLOCK_SIZE = [128, 128]
-MXFP8_WEIGHT_BLOCK_SIZE = [1, 32]
 
 
 def _load_index(model_dir: Path) -> dict[str, Any]:
@@ -70,33 +74,6 @@ def _tensor_meta(model_dir: Path, weight_map: dict[str, str], key: str) -> tuple
         return tensor_slice.get_shape(), tensor_slice.get_dtype()
 
 
-def _ceil_div(a: int, b: int) -> int:
-    return (a + b - 1) // b
-
-
-def _infer_attention_format(
-    weight_shape: list[int],
-    scale_shape: list[int],
-    scale_dtype: str,
-) -> str:
-    if scale_dtype == "F32":
-        expected = [
-            _ceil_div(weight_shape[0], FP8_PB_WEIGHT_BLOCK_SIZE[0]),
-            _ceil_div(weight_shape[1], FP8_PB_WEIGHT_BLOCK_SIZE[1]),
-        ]
-        if scale_shape != expected:
-            raise RuntimeError(
-                f"Expected FP8_PB_WO scale shape {expected}, got {scale_shape}"
-            )
-        return "fp8-pb"
-    if scale_dtype == "U8":
-        expected = [weight_shape[0], _ceil_div(weight_shape[1], MXFP8_WEIGHT_BLOCK_SIZE[1])]
-        if scale_shape != expected:
-            raise RuntimeError(f"Expected MXFP8 scale shape {expected}, got {scale_shape}")
-        return "mxfp8"
-    raise RuntimeError(f"Unsupported QKV scale dtype {scale_dtype}; expected F32 or U8")
-
-
 def _validate_replacements(
     base_dir: Path,
     fp8_dir: Path,
@@ -123,7 +100,7 @@ def _validate_replacements(
             raise RuntimeError(f"Expected FP8 E4M3 weight for {key}, got {fp8_dtype}")
         if len(scale_shape) != 2:
             raise RuntimeError(f"Expected 2D scale for {_qkv_scale_name(key)}, got {scale_shape}")
-        inferred_format = _infer_attention_format(fp8_shape, scale_shape, scale_dtype)
+        inferred_format = infer_qkv_quant_format(fp8_shape, scale_shape, scale_dtype)
         if requested_format != "auto" and inferred_format != requested_format:
             raise RuntimeError(
                 f"{key} is {inferred_format}, but --attention-format={requested_format}"

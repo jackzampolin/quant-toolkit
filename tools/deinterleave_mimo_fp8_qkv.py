@@ -27,9 +27,19 @@ from safetensors import safe_open
 from safetensors.torch import save_file
 
 from dequantize_fp8 import build_mimo_qkv_specs, build_weight_map_from_safetensors
+from mimo_qkv_formats import (
+    FP8_PB_WEIGHT_BLOCK_SIZE,
+    MXFP8_GROUP_SIZE,
+    MXFP8_WEIGHT_BLOCK_SIZE,
+    infer_qkv_quant_format,
+    qkv_config_group,
+    qkv_quantized_layer_entry,
+)
 
 
-COPY_EXTS = {".json", ".txt", ".model", ".py", ".jinja"}
+COPY_EXTS = {".json", ".txt", ".model", ".py", ".jinja", ".pt", ".md", ".png"}
+COPY_NAMES = {".gitattributes"}
+INDEX_NAME = "model.safetensors.index.json"
 QKV_RE = re.compile(r"^model\.layers\.(\d+)\.self_attn\.qkv_proj\.weight$")
 MTP_QKV_RE = re.compile(r"^model\.mtp\.layers\.(\d+)\.self_attn\.qkv_proj\.weight$")
 
@@ -42,7 +52,7 @@ def resolve_model_dir(model_id: str) -> Path:
 
 
 def load_index(model_dir: Path, ignore_index: bool) -> tuple[dict[str, str], dict]:
-    index_path = model_dir / "model.safetensors.index.json"
+    index_path = model_dir / INDEX_NAME
     if not ignore_index and index_path.exists():
         with index_path.open() as f:
             index = json.load(f)
@@ -288,7 +298,18 @@ def convert_deinterleaved_qkv_to_mxfp8(
 
 def layer_sort_key(weight_name: str) -> int:
     match = QKV_RE.match(weight_name)
+    if match:
+        return int(match.group(1))
+    match = MTP_QKV_RE.match(weight_name)
     return int(match.group(1)) if match else 10**9
+
+
+def qkv_sort_key(weight_name: str) -> tuple[int, int]:
+    if QKV_RE.match(weight_name):
+        return (0, layer_sort_key(weight_name))
+    if MTP_QKV_RE.match(weight_name):
+        return (1, layer_sort_key(weight_name))
+    return (2, layer_sort_key(weight_name))
 
 
 def qkv_sizes_from_config(config: dict, is_swa: bool) -> tuple[int, int, int]:
@@ -323,6 +344,12 @@ def tensor_shape(model_dir: Path, weight_map: dict[str, str], key: str) -> list[
         return f.get_slice(key).get_shape()
 
 
+def tensor_meta(model_dir: Path, weight_map: dict[str, str], key: str) -> tuple[list[int], str]:
+    with safe_open(model_dir / weight_map[key], framework="pt", device="cpu") as f:
+        tensor_slice = f.get_slice(key)
+        return tensor_slice.get_shape(), tensor_slice.get_dtype()
+
+
 def build_mimo_mtp_qkv_specs(
     config: dict,
     model_dir: Path,
@@ -334,13 +361,14 @@ def build_mimo_mtp_qkv_specs(
         is_swa: qkv_sizes_from_config(config, is_swa)
         for is_swa in (False, True)
     }
+    unique_candidate_sizes = sorted(set(candidate_sizes.values()))
     for weight_name in sorted(weight_map):
         if MTP_QKV_RE.match(weight_name) is None:
             continue
         rows = tensor_shape(model_dir, weight_map, weight_name)[0]
         matches = [
-            (is_swa, sizes)
-            for is_swa, sizes in candidate_sizes.items()
+            sizes
+            for sizes in unique_candidate_sizes
             if sum(sizes) == rows
         ]
         if len(matches) != 1:
@@ -348,7 +376,7 @@ def build_mimo_mtp_qkv_specs(
                 f"Cannot infer MTP QKV split for {weight_name}: rows={rows}, "
                 f"candidate_splits={candidate_sizes}"
             )
-        _, (q_size, k_size, v_size) = matches[0]
+        q_size, k_size, v_size = matches[0]
         if q_size % tp_size != 0 or k_size % tp_size != 0 or v_size % tp_size != 0:
             raise ValueError(
                 f"{weight_name} cannot be evenly deinterleaved with TP size {tp_size}: "
@@ -370,7 +398,7 @@ def summarize_targets(
 ) -> tuple[dict[str, dict[str, int]], dict[str, str]]:
     exact = {}
     inexact = {}
-    for weight_name, spec in sorted(specs.items(), key=lambda item: layer_sort_key(item[0])):
+    for weight_name, spec in sorted(specs.items(), key=lambda item: qkv_sort_key(item[0])):
         reason = exact_fp8_deinterleave_reason(spec, block_m)
         if reason is None:
             exact[weight_name] = spec
@@ -379,11 +407,18 @@ def summarize_targets(
     return exact, inexact
 
 
-def format_layers(weight_names: list[str], limit: int = 24) -> str:
-    layers = [str(layer_sort_key(name)) for name in weight_names]
-    if len(layers) > limit:
-        return ", ".join(layers[:limit]) + f", ... ({len(layers)} total)"
-    return ", ".join(layers)
+def format_qkv_names(weight_names: list[str], limit: int = 24) -> str:
+    labels = []
+    for name in sorted(weight_names, key=qkv_sort_key):
+        if QKV_RE.match(name):
+            labels.append(f"L{layer_sort_key(name)}")
+        elif MTP_QKV_RE.match(name):
+            labels.append(f"MTP{layer_sort_key(name)}")
+        else:
+            labels.append(name)
+    if len(labels) > limit:
+        return ", ".join(labels[:limit]) + f", ... ({len(labels)} total)"
+    return ", ".join(labels)
 
 
 def prepare_output_dir(output_dir: Path, force: bool) -> None:
@@ -400,12 +435,27 @@ def prepare_output_dir(output_dir: Path, force: bool) -> None:
 
 def copy_sidecars(source_dir: Path, output_dir: Path) -> None:
     for src in source_dir.rglob("*"):
-        if not src.is_file() or src.suffix not in COPY_EXTS or "safetensors" in src.name:
+        if not src.is_file() or (src.suffix not in COPY_EXTS and src.name not in COPY_NAMES):
             continue
         rel_path = src.relative_to(source_dir)
         dst = output_dir / rel_path
         dst.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(src, dst)
+
+
+def link_or_copy_unindexed_safetensors(
+    source_dir: Path,
+    output_dir: Path,
+    indexed_shards: set[str],
+    mode: str,
+) -> None:
+    for src in source_dir.rglob("*.safetensors"):
+        rel_path = src.relative_to(source_dir)
+        if len(rel_path.parts) == 1 and src.name in indexed_shards:
+            continue
+        dst = output_dir / rel_path
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        link_or_copy(src, dst, mode)
 
 
 def link_or_copy(src: Path, dst: Path, mode: str) -> None:
@@ -504,9 +554,134 @@ def write_index(output_dir: Path, weight_map: dict[str, str], metadata: dict) ->
         (output_dir / file_name).stat().st_size
         for file_name in set(weight_map.values())
     )
-    with (output_dir / "model.safetensors.index.json").open("w") as f:
+    with (output_dir / INDEX_NAME).open("w") as f:
         json.dump({"metadata": metadata, "weight_map": weight_map}, f, indent=2, sort_keys=True)
         f.write("\n")
+
+
+def qkv_prefix(weight_name: str) -> str:
+    if not weight_name.endswith(".weight"):
+        raise ValueError(f"Expected a QKV weight tensor, got {weight_name}")
+    return weight_name.removesuffix(".weight")
+
+
+def is_qkv_prefix(prefix: str) -> bool:
+    return QKV_RE.match(f"{prefix}.weight") is not None or MTP_QKV_RE.match(f"{prefix}.weight") is not None
+
+
+def detect_output_qkv_formats(
+    output_dir: Path,
+    weight_map: dict[str, str],
+    specs: dict[str, dict[str, int]],
+    expected_format: str,
+) -> dict[str, list[str]]:
+    prefixes_by_format: dict[str, list[str]] = {"fp8-pb": [], "mxfp8": []}
+    for weight_name in sorted(specs, key=qkv_sort_key):
+        scale_name = qkv_scale_name(weight_name)
+        if weight_name not in weight_map:
+            raise RuntimeError(f"Output index is missing QKV weight {weight_name}")
+        if scale_name not in weight_map:
+            raise RuntimeError(f"Output index is missing QKV scale {scale_name}")
+
+        weight_shape, weight_dtype = tensor_meta(output_dir, weight_map, weight_name)
+        scale_shape, scale_dtype = tensor_meta(output_dir, weight_map, scale_name)
+        if weight_dtype != "F8_E4M3":
+            raise RuntimeError(f"Expected FP8 E4M3 weight for {weight_name}, got {weight_dtype}")
+        if len(scale_shape) != 2:
+            raise RuntimeError(f"Expected 2D scale for {scale_name}, got {scale_shape}")
+
+        inferred_format = infer_qkv_quant_format(weight_shape, scale_shape, scale_dtype)
+        if inferred_format != expected_format:
+            raise RuntimeError(
+                f"{weight_name} is {inferred_format}, but output format is {expected_format}"
+            )
+        prefixes_by_format[inferred_format].append(qkv_prefix(weight_name))
+    return {name: prefixes for name, prefixes in prefixes_by_format.items() if prefixes}
+
+
+def update_qkv_quant_metadata(
+    output_dir: Path,
+    weight_map: dict[str, str],
+    specs: dict[str, dict[str, int]],
+    output_format: str,
+    tp_size: int,
+    include_mtp: bool,
+) -> int:
+    if not specs:
+        return 0
+
+    config_path = output_dir / "config.json"
+    if not config_path.exists():
+        raise RuntimeError(f"Cannot write QKV quantization metadata; missing {config_path}")
+
+    with config_path.open() as f:
+        config = json.load(f)
+
+    quant_config = config.get("quantization_config")
+    if quant_config is None:
+        quant_config = {}
+        config["quantization_config"] = quant_config
+    if not isinstance(quant_config, dict):
+        raise RuntimeError("config.json quantization_config must be an object")
+
+    prefixes_by_format = detect_output_qkv_formats(output_dir, weight_map, specs, output_format)
+    qkv_quantized_layers: dict[str, dict] = {}
+    for format_name, prefixes in prefixes_by_format.items():
+        entry = qkv_quantized_layer_entry(format_name)
+        for prefix in prefixes:
+            qkv_quantized_layers[prefix] = dict(entry)
+
+    config_groups = quant_config.get("config_groups")
+    if not isinstance(config_groups, dict):
+        config_groups = {}
+    config_groups = dict(config_groups)
+    config_groups.pop("group_fp8_qkv", None)
+    config_groups.pop("group_mxfp8_qkv", None)
+    for format_name, prefixes in prefixes_by_format.items():
+        group_name = "group_fp8_qkv" if format_name == "fp8-pb" else "group_mxfp8_qkv"
+        config_groups[group_name] = qkv_config_group(format_name, prefixes)
+    quant_config["config_groups"] = dict(sorted(config_groups.items()))
+
+    quantized_layers = quant_config.get("quantized_layers")
+    if not isinstance(quantized_layers, dict):
+        quantized_layers = {}
+    quantized_layers = {
+        prefix: value
+        for prefix, value in quantized_layers.items()
+        if not is_qkv_prefix(prefix)
+    }
+    quantized_layers.update(qkv_quantized_layers)
+    quant_config["quantized_layers"] = dict(sorted(quantized_layers.items()))
+    quant_config["qkv_quantized_layers"] = dict(sorted(qkv_quantized_layers.items()))
+
+    formats = {}
+    for format_name, prefixes in prefixes_by_format.items():
+        format_metadata = dict(qkv_quantized_layer_entry(format_name))
+        if format_name == "mxfp8":
+            format_metadata["weight_block_size"] = MXFP8_WEIGHT_BLOCK_SIZE
+        format_metadata["targets"] = prefixes
+        formats[format_name] = format_metadata
+
+    target_prefixes = [
+        prefix
+        for format_name in sorted(prefixes_by_format)
+        for prefix in prefixes_by_format[format_name]
+    ]
+    quant_config["attention_projection_quantization"] = {
+        "format": output_format,
+        "formats": formats,
+        "layout": config.get("attention_projection_layout", "fused_qkv"),
+        "normalized_qkv_layout": "q_then_k_then_v",
+        "scale_tensor_suffix": ".weight_scale_inv",
+        "source_qkv_tp_size": tp_size,
+        "targets": target_prefixes,
+        "includes_mtp_qkv": include_mtp,
+    }
+
+    with config_path.open("w") as f:
+        json.dump(config, f, indent=2, sort_keys=True)
+        f.write("\n")
+    return len(target_prefixes)
 
 
 def parse_args() -> argparse.Namespace:
@@ -517,9 +692,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--ignore-index", action="store_true", help="Scan local safetensors instead of using the index.")
     parser.add_argument("--mimo-qkv-tp-size", type=int, default=4,
                         help="Tensor-parallel packing size used by MiMo fused QKV tensors.")
-    parser.add_argument("--block-m", type=int, default=128,
+    parser.add_argument("--block-m", type=int, default=FP8_PB_WEIGHT_BLOCK_SIZE[0],
                         help="FP8 weight scale block height. MiMo uses 128.")
-    parser.add_argument("--block-n", type=int, default=128,
+    parser.add_argument("--block-n", type=int, default=FP8_PB_WEIGHT_BLOCK_SIZE[1],
                         help="FP8 weight scale block width. MiMo uses 128.")
     parser.add_argument("--output-format", choices=("fp8-pb", "mxfp8"), default="fp8-pb",
                         help="Output QKV format. fp8-pb preserves/requants MiMo 128x128 FP8; "
@@ -527,7 +702,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--on-inexact", choices=("error", "skip", "requantize"), default="error",
                         help="What to do when exact FP8 deinterleaving is impossible in fp8-pb mode.")
     parser.add_argument("--no-mtp", action="store_true",
-                        help="In mxfp8 mode, do not also deinterleave/convert model.mtp.* QKV tensors.")
+                        help="Do not also normalize model.mtp.* QKV tensors.")
     parser.add_argument("--unchanged-shards", choices=("symlink", "hardlink", "copy"), default="symlink",
                         help="How to place safetensors shards that do not need rewriting.")
     parser.add_argument("--dry-run", action="store_true", help="Report which layers can be rewritten exactly.")
@@ -552,30 +727,30 @@ def main() -> None:
     specs = build_mimo_qkv_specs(config, source_weight_map, args.mimo_qkv_tp_size)
     mtp_specs = (
         {}
-        if args.no_mtp or args.output_format != "mxfp8"
+        if args.no_mtp
         else build_mimo_mtp_qkv_specs(config, model_dir, source_weight_map, args.mimo_qkv_tp_size)
     )
-    exact, inexact = summarize_targets(specs, args.block_m)
+    all_specs = {**specs, **mtp_specs}
+    exact, inexact = summarize_targets(all_specs, args.block_m)
     block_size = (args.block_m, args.block_n)
 
     print(f"Source: {model_dir}")
     print(f"Output format: {args.output_format}")
     print(f"Main MiMo QKV tensors: {len(specs)}")
+    print(f"MTP MiMo QKV tensors: {len(mtp_specs)}")
     print(f"Exactly FP8-deinterleavable: {len(exact)}")
     if exact:
-        print(f"  layers: {format_layers(list(exact))}")
+        print(f"  tensors: {format_qkv_names(list(exact))}")
     print(f"Inexact with {args.block_m}-row FP8 scale blocks: {len(inexact)}")
     if inexact:
-        print(f"  layers: {format_layers(list(inexact))}")
+        print(f"  tensors: {format_qkv_names(list(inexact))}")
         first_name = next(iter(inexact))
-        print(f"  first reason: layer {layer_sort_key(first_name)}: {inexact[first_name]}")
+        print(f"  first reason: {format_qkv_names([first_name])}: {inexact[first_name]}")
         if args.output_format == "mxfp8":
             print("  action: dequantize -> deinterleave -> ModelOpt MXFP8")
         elif args.on_inexact == "requantize":
             print("  action: dequantize -> deinterleave -> requantize these tensors")
-    if args.output_format == "mxfp8":
-        print(f"MTP QKV tensors deinterleaved and converted: {len(mtp_specs)}")
-    if not specs and not mtp_specs:
+    if not all_specs:
         raise SystemExit("No MiMo QKV tensors found in the source checkpoint.")
 
     if args.dry_run:
@@ -591,7 +766,7 @@ def main() -> None:
     mxfp8_scale_names: set[str] = set()
     missing_scales = []
     if args.output_format == "mxfp8":
-        mxfp8_qkv_specs = {**specs, **mtp_specs}
+        mxfp8_qkv_specs = all_specs
         for weight_name in mxfp8_qkv_specs:
             scale_name = qkv_scale_name(weight_name)
             if scale_name not in source_weight_map:
@@ -607,7 +782,7 @@ def main() -> None:
             )
         target_weight_specs = exact
         requant_weight_specs = {
-            weight_name: specs[weight_name]
+            weight_name: all_specs[weight_name]
             for weight_name in inexact
             if args.on_inexact == "requantize"
         }
@@ -625,6 +800,11 @@ def main() -> None:
             f"Missing {len(missing_scales)} FP8 scale sidecar(s); first missing: {missing_scales[0]}"
         )
 
+    output_qkv_specs = (
+        mxfp8_qkv_specs
+        if args.output_format == "mxfp8"
+        else {**target_weight_specs, **requant_weight_specs}
+    )
     modified_files = {
         source_weight_map[name]
         for name in [
@@ -640,6 +820,12 @@ def main() -> None:
 
     prepare_output_dir(args.output_dir, args.force)
     copy_sidecars(model_dir, args.output_dir)
+    link_or_copy_unindexed_safetensors(
+        model_dir,
+        args.output_dir,
+        indexed_shards=set(safetensors_files),
+        mode=args.unchanged_shards,
+    )
 
     total_weights = 0
     total_scales = 0
@@ -672,11 +858,26 @@ def main() -> None:
             f"{mxfp8} MXFP8 QKV weight(s)"
         )
 
-    write_index(args.output_dir, output_weight_map, metadata)
+    index_metadata = dict(metadata)
+    index_metadata["normalized_qkv_format"] = args.output_format
+    index_metadata["normalized_qkv_tensors"] = len(output_qkv_specs)
+    index_metadata["normalized_qkv_source_tp_size"] = args.mimo_qkv_tp_size
+    index_metadata["normalized_qkv_includes_mtp_qkv"] = bool(mtp_specs)
+    index_metadata["normalized_qkv_source"] = str(model_dir)
+    write_index(args.output_dir, output_weight_map, index_metadata)
+    metadata_targets = update_qkv_quant_metadata(
+        args.output_dir,
+        output_weight_map,
+        output_qkv_specs,
+        args.output_format,
+        args.mimo_qkv_tp_size,
+        include_mtp=bool(mtp_specs),
+    )
     if args.output_format == "mxfp8":
         print(f"\nWrote ModelOpt MXFP8 MiMo checkpoint to {args.output_dir}")
     else:
         print(f"\nWrote FP8-preserving MiMo checkpoint to {args.output_dir}")
+    print(f"  QKV quantization metadata targets: {metadata_targets}")
     print(f"  exact rewritten QKV weights: {total_weights}")
     print(f"  exact rewritten scale sidecars: {total_scales}")
     print(f"  dequantized/requantized QKV weights: {total_requantized}")
