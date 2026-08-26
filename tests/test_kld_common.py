@@ -4,11 +4,13 @@ import unittest
 from pathlib import Path
 from types import SimpleNamespace
 
+import numpy as np
 import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
 
 from kld_common import dense_prompt_logits, summarize_kld, tokenwise_kld
+from replay_prefill_kld import independent_tokenwise_kld
 
 
 class KldCommonTests(unittest.TestCase):
@@ -54,6 +56,26 @@ class KldCommonTests(unittest.TestCase):
         self.assertTrue(are_log_probs)
         expected = torch.tensor([[-1.0, -2.0, -3.0], [-4.0, -5.0, -6.0]])
         self.assertTrue(torch.equal(dense, expected))
+
+    def test_independent_numpy_replay_matches_torch_producer(self):
+        generator = torch.Generator().manual_seed(53)
+        reference = torch.randn(17, 257, generator=generator, dtype=torch.float32)
+        candidate = reference + 0.1 * torch.randn(
+            17, 257, generator=generator, dtype=torch.float32
+        )
+        produced, reference_top1, candidate_top1 = tokenwise_kld(
+            reference, candidate, chunk_rows=3
+        )
+        replayed, replay_reference_top1, replay_candidate_top1 = (
+            independent_tokenwise_kld(
+                reference.numpy(), candidate.numpy(), chunk_rows=5
+            )
+        )
+        self.assertTrue(
+            np.allclose(produced.numpy(), replayed, rtol=0.0, atol=1e-12)
+        )
+        self.assertTrue(np.array_equal(reference_top1.numpy(), replay_reference_top1))
+        self.assertTrue(np.array_equal(candidate_top1.numpy(), replay_candidate_top1))
 
 
 if __name__ == "__main__":

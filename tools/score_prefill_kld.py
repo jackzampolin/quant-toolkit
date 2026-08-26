@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
 import time
 from pathlib import Path
 
@@ -15,8 +16,10 @@ from vllm import LLM, SamplingParams
 from vllm.inputs import TokensPrompt
 
 from kld_common import (
+    canonical_json_sha256,
     dense_prompt_logits,
     sampling_params_for_prompt_logits,
+    sha256_file,
     summarize_kld,
     tokenwise_kld,
 )
@@ -46,6 +49,12 @@ def main():
     parser.add_argument("--max-num-batched-tokens", type=int, default=2048)
     parser.add_argument("--chunk-rows", type=int, default=8)
     parser.add_argument("--compute-dtype", choices=("float32", "float64"), default="float64")
+    parser.add_argument(
+        "--storage-dtype",
+        choices=("bfloat16", "float32"),
+        default="float32",
+        help="Storage used for candidate logits and producer KLD; use float32 for replay.",
+    )
     parser.add_argument("--llm-extra-json", default="{}")
     parser.add_argument("--trust-remote-code", action="store_true")
     args = parser.parse_args()
@@ -55,6 +64,14 @@ def main():
         reference_manifest = json.load(handle)
     if reference_manifest.get("schema") != "quant-toolkit.prefill-logits.v1":
         raise ValueError("unsupported reference manifest schema")
+    expected_manifest_sha = reference_manifest.get("manifest_sha256")
+    manifest_body = {
+        key: value
+        for key, value in reference_manifest.items()
+        if key != "manifest_sha256"
+    }
+    if not expected_manifest_sha or canonical_json_sha256(manifest_body) != expected_manifest_sha:
+        raise ValueError("reference manifest seal mismatch")
     destination = Path(args.output_dir)
     destination.mkdir(parents=True, exist_ok=True)
     if any(destination.iterdir()):
@@ -93,13 +110,17 @@ def main():
     model = LLM(**llm_values)
     vocab_size = int(model.llm_engine.model_config.get_vocab_size())
     compute_dtype = torch.float64 if args.compute_dtype == "float64" else torch.float32
+    storage_dtype = torch.bfloat16 if args.storage_dtype == "bfloat16" else torch.float32
     all_kld = []
     all_ref_top1 = []
     all_candidate_top1 = []
     windows = []
     started = time.time()
     for record in reference_manifest["windows"]:
-        tensors = load_file(reference_dir / record["file"])
+        reference_path = reference_dir / record["file"]
+        if sha256_file(reference_path) != record.get("sha256"):
+            raise ValueError(f"reference logit hash mismatch: {reference_path}")
+        tensors = load_file(reference_path)
         reference = tensors["logits"]
         input_ids = tensors["input_ids"].to(torch.int64).tolist()
         if reference.shape[1] != vocab_size:
@@ -111,12 +132,23 @@ def main():
             "target_token_ids": input_ids[1:],
         }
         output = model.generate([prompt], sampling_params=params)[0]
-        candidate, _ = dense_prompt_logits(
+        candidate, candidate_values_are_log_probs = dense_prompt_logits(
             output,
             supports_prompt_logits,
             reference.shape[0],
             vocab_size,
         )
+        candidate = candidate.to(storage_dtype)
+        candidate_path = destination / f"candidate_logits_{record['index']}.safetensors"
+        candidate_temporary = destination / f".{candidate_path.name}.incomplete"
+        save_file(
+            {
+                "logits": candidate,
+                "input_ids": torch.tensor(input_ids, dtype=torch.int32),
+            },
+            str(candidate_temporary),
+        )
+        os.replace(candidate_temporary, candidate_path)
         kld, ref_top1, candidate_top1 = tokenwise_kld(
             reference,
             candidate,
@@ -125,6 +157,11 @@ def main():
         )
         window_summary = summarize_kld(kld, ref_top1, candidate_top1)
         window_summary["index"] = record["index"]
+        window_summary["reference_file"] = record["file"]
+        window_summary["candidate_file"] = candidate_path.name
+        window_summary["candidate_file_bytes"] = candidate_path.stat().st_size
+        window_summary["candidate_file_sha256"] = sha256_file(candidate_path)
+        window_summary["candidate_values_are_log_probs"] = candidate_values_are_log_probs
         windows.append(window_summary)
         all_kld.append(kld)
         all_ref_top1.append(ref_top1)
@@ -149,10 +186,12 @@ def main():
             "return_prompt_logits" if supports_prompt_logits else "flat_prompt_logprobs"
         ),
         "compute_dtype": args.compute_dtype,
+        "candidate_storage_dtype": args.storage_dtype,
         "aggregate": aggregate,
         "windows": windows,
         "elapsed_sec": time.time() - started,
     }
+    tokenwise_path = destination / "tokenwise.safetensors"
     save_file(
         {
             "kld_nats": all_kld,
@@ -160,8 +199,12 @@ def main():
             "reference_top1": all_ref_top1,
             "candidate_top1": all_candidate_top1,
         },
-        str(destination / "tokenwise.safetensors"),
+        str(tokenwise_path),
     )
+    result["tokenwise_file"] = tokenwise_path.name
+    result["tokenwise_file_bytes"] = tokenwise_path.stat().st_size
+    result["tokenwise_file_sha256"] = sha256_file(tokenwise_path)
+    result["summary_sha256"] = canonical_json_sha256(result)
     with open(destination / "summary.json", "w") as handle:
         json.dump(result, handle, indent=2, sort_keys=True)
         handle.write("\n")

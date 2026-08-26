@@ -6,6 +6,7 @@ dependencies = [
     "accelerate>=1.0",
     "datasets>=3.0",
     "nvidia-modelopt[torch] @ git+https://github.com/NVIDIA/TensorRT-Model-Optimizer.git",
+    "numpy>=2.0",
     "pillow",
     "protobuf",
     "requests",

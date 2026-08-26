@@ -20,7 +20,12 @@ from transformers import AutoTokenizer
 from vllm import LLM, SamplingParams
 from vllm.inputs import TokensPrompt
 
-from kld_common import dense_prompt_logits, sampling_params_for_prompt_logits
+from kld_common import (
+    canonical_json_sha256,
+    dense_prompt_logits,
+    sampling_params_for_prompt_logits,
+    sha256_file,
+)
 
 
 def load_source_text(args, tokenizer) -> tuple[str, dict]:
@@ -131,7 +136,12 @@ def main():
     parser.add_argument("--tensor-parallel-size", type=int, default=8)
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.95)
     parser.add_argument("--dtype", default="bfloat16")
-    parser.add_argument("--storage-dtype", choices=("bfloat16", "float32"), default="bfloat16")
+    parser.add_argument(
+        "--storage-dtype",
+        choices=("bfloat16", "float32"),
+        default="float32",
+        help="Keep float32 for publishable KLD and independent NumPy replay.",
+    )
     parser.add_argument(
         "--kv-cache-dtype",
         default="auto",
@@ -235,6 +245,7 @@ def main():
                 "vocab_size": logits.shape[1],
                 "stored_values_are_log_probs": are_log_probs,
                 "bytes": path.stat().st_size,
+                "sha256": sha256_file(path),
             }
         )
         print(json.dumps({"event": "reference_window_written", **manifest["windows"][-1]}), flush=True)
@@ -245,6 +256,7 @@ def main():
     if not manifest["windows"]:
         raise RuntimeError("no complete windows were captured")
     manifest["elapsed_sec"] = time.time() - started
+    manifest["manifest_sha256"] = canonical_json_sha256(manifest)
     with open(destination / "manifest.json", "w") as handle:
         json.dump(manifest, handle, indent=2, sort_keys=True)
         handle.write("\n")

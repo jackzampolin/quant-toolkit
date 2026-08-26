@@ -6,11 +6,32 @@ reported in nats and bits; bits are nats / ln(2).
 
 from __future__ import annotations
 
+import hashlib
 import inspect
+import json
 import math
+from pathlib import Path
 
 import torch
 import torch.nn.functional as F
+
+
+def canonical_json_sha256(value) -> str:
+    payload = json.dumps(
+        value,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
+def sha256_file(path: str | Path, chunk_bytes: int = 16 * 1024 * 1024) -> str:
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as handle:
+        while chunk := handle.read(chunk_bytes):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def sampling_params_for_prompt_logits(SamplingParams):
@@ -135,7 +156,7 @@ def summarize_kld(
     def stats(values):
         return {
             "mean": float(values.mean()),
-            "median": float(values.median()),
+            "median": float(torch.quantile(values, 0.5)),
             "p95": float(torch.quantile(values, 0.95)),
             "p99": float(torch.quantile(values, 0.99)),
             "max": float(values.max()),
