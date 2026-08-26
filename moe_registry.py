@@ -111,6 +111,10 @@ class _QuantFusedExperts(QuantModule):
             up = up.clamp(min=-self.swiglu_limit, max=self.swiglu_limit)
             glu = gate * torch.sigmoid(gate * self.swiglu_alpha)
             return (up + 1.0) * glu
+        if hasattr(self, "swiglu_limit"):
+            gate = gate.clamp(max=self.swiglu_limit)
+            up = up.clamp(min=-self.swiglu_limit, max=self.swiglu_limit)
+            return torch.nn.functional.silu(gate) * up
         return self.act_fn(gate) * up
 
     def forward(self, hidden_states, top_k_index, top_k_weights):
@@ -175,6 +179,45 @@ def register_glm5_moe_for_quantization():
         )(_QuantFusedExperts)
 
     print("✓ Registered GLM-5 MoE for quantization")
+
+
+# ---------------------------------------------------------------------------
+# GLM-5.3-Flash (glm5_next).
+# ---------------------------------------------------------------------------
+
+class _QuantGlm5NextTextMoE(_QuantSparseMoe):
+    @property
+    def num_experts(self):
+        return self.experts.num_experts
+
+    def forward(self, hidden_states):
+        return super(_QuantSparseMoe, self).forward(hidden_states)
+
+
+def register_glm5_next_moe_for_quantization():
+    """Register upstream Transformers GLM-5.3 MoE classes with ModelOpt."""
+    try:
+        from transformers.models.glm5_next.modeling_glm5_next import (
+            Glm5NextTextExperts,
+            Glm5NextTextMoE,
+        )
+    except ImportError as exc:
+        raise RuntimeError(
+            "GLM-5.3 requires Transformers with glm5_next support "
+            "(huggingface/transformers#48342)"
+        ) from exc
+
+    if QuantModuleRegistry.get(Glm5NextTextMoE) is None:
+        QuantModuleRegistry.register(
+            {Glm5NextTextMoE: "Glm5NextTextMoE"}
+        )(_QuantGlm5NextTextMoE)
+
+    if QuantModuleRegistry.get(Glm5NextTextExperts) is None:
+        QuantModuleRegistry.register(
+            {Glm5NextTextExperts: "Glm5NextTextExperts"}
+        )(_QuantFusedExperts)
+
+    print("✓ Registered GLM-5.3-Flash MoE for quantization")
 
 
 # ---------------------------------------------------------------------------

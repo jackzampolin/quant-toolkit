@@ -898,6 +898,12 @@ _MINIMAX_M3_ALLOWED_QUANTIZER_RE = re.compile(
     r"(?:weight_quantizer|input_quantizer)$"
 )
 
+_GLM53_FLASH_ALLOWED_QUANTIZER_RE = re.compile(
+    r"^model\.language_model\.layers\.\d+\.mlp\.experts\."
+    r"(?:gate_proj|up_proj|down_proj)\.\d+\."
+    r"(?:weight_quantizer|input_quantizer)$"
+)
+
 def _validate_enabled_quantizers(m):
     allowed_re = None
     label = None
@@ -907,6 +913,9 @@ def _validate_enabled_quantizers(m):
     elif args.model == "minimax_m3":
         allowed_re = _MINIMAX_M3_ALLOWED_QUANTIZER_RE
         label = "MiniMax M3"
+    elif args.model == "glm5_3_flash":
+        allowed_re = _GLM53_FLASH_ALLOWED_QUANTIZER_RE
+        label = "GLM-5.3-Flash"
 
     if allowed_re is None:
         return
