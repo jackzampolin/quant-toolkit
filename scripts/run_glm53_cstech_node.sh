@@ -10,6 +10,9 @@ IMAGE="${IMAGE:-cstechdev/vllm@sha256:0bd709e80b8ff13ae5de8f7d7f708a499fade3a269
 MODEL_DIR="${MODEL_DIR:-/data/models/GLM-5.3-Flash-BF16-b1967181}"
 MODEL_REVISION="${MODEL_REVISION:-b1967181a3917ae70a437f4884748f6b8e3a1f4d}"
 SERVED_MODEL_NAME="${SERVED_MODEL_NAME:-GLM-5.3-Flash-BF16}"
+MODEL_MOUNT_SOURCE="${MODEL_MOUNT_SOURCE:-${MODEL_DIR}}"
+MODEL_MOUNT_DEST="${MODEL_MOUNT_DEST:-/model}"
+MODEL_CONTAINER_PATH="${MODEL_CONTAINER_PATH:-/model}"
 
 NODE_RANK="${NODE_RANK:?set NODE_RANK to 0 (head) or 1 (worker)}"
 NNODES="${NNODES:-2}"
@@ -105,6 +108,10 @@ if [[ ! -f "${MODEL_DIR}/model.safetensors.index.json" ]]; then
   echo "Missing model index under ${MODEL_DIR}." >&2
   exit 2
 fi
+if [[ ! -d "${MODEL_MOUNT_SOURCE}" ]]; then
+  echo "Missing model mount source: ${MODEL_MOUNT_SOURCE}." >&2
+  exit 2
+fi
 
 CONTAINER_NAME="${CONTAINER_NAME:-glm53-flash-bf16-tp8-${ROLE}}"
 CACHE_DIR="${CACHE_DIR:-${HOME}/.cache/vllm-glm53-flash-bf16-tp8}"
@@ -127,6 +134,8 @@ fi
 prefix_args=()
 if [[ "${PREFIX_CACHING}" == 1 ]]; then
   prefix_args=(--enable-prefix-caching)
+else
+  prefix_args=(--no-enable-prefix-caching)
 fi
 speculative_args=()
 if ((MTP_TOKENS > 0)); then
@@ -167,10 +176,10 @@ docker run -d \
   -e NCCL_RMA_PLUGIN=none \
   -e NCCL_GIN_PLUGIN=none \
   "${capture_args[@]}" \
-  -v "${MODEL_DIR}:/model:ro" \
+  -v "${MODEL_MOUNT_SOURCE}:${MODEL_MOUNT_DEST}:ro" \
   -v "${CACHE_DIR}:/root/.cache" \
   "${IMAGE}" \
-  /model \
+  "${MODEL_CONTAINER_PATH}" \
   --served-model-name "${SERVED_MODEL_NAME}" \
   --host 0.0.0.0 \
   --port "${PORT}" \
