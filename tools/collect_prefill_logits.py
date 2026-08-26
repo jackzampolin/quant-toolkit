@@ -15,17 +15,16 @@ import time
 from pathlib import Path
 
 import torch
-from safetensors.torch import save_file
-from transformers import AutoTokenizer
-from vllm import LLM, SamplingParams
-from vllm.inputs import TokensPrompt
-
 from kld_common import (
     canonical_json_sha256,
     dense_prompt_logits,
     sampling_params_for_prompt_logits,
     sha256_file,
 )
+from safetensors.torch import save_file
+from transformers import AutoTokenizer
+from vllm import LLM, SamplingParams
+from vllm.inputs import TokensPrompt
 
 
 def load_source_text(args, tokenizer) -> tuple[str, dict]:
@@ -117,6 +116,16 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", required=True)
     parser.add_argument("--output-dir", required=True)
+    parser.add_argument(
+        "--role",
+        choices=("canonical", "candidate"),
+        default="canonical",
+        help="Semantic capture role; it does not change inference or storage.",
+    )
+    parser.add_argument(
+        "--run-label",
+        help="Stable operator label for the weight/topology/KV policy being captured.",
+    )
     parser.add_argument("--tokenizer")
     parser.add_argument("--revision")
     parser.add_argument("--tokenizer-revision")
@@ -186,10 +195,13 @@ def main():
     params, supports_prompt_logits = sampling_params_for_prompt_logits(SamplingParams)
     engine_request = llm_kwargs(args)
     model = LLM(**engine_request)
-    storage_dtype = torch.bfloat16 if args.storage_dtype == "bfloat16" else torch.float32
+    storage_dtype = (
+        torch.bfloat16 if args.storage_dtype == "bfloat16" else torch.float32
+    )
     manifest = {
         "schema": "quant-toolkit.prefill-logits.v1",
-        "role": "reference",
+        "role": args.role,
+        "run_label": args.run_label,
         "model": args.model,
         "model_revision": args.revision,
         "tokenizer": tokenizer_id,
@@ -248,7 +260,16 @@ def main():
                 "sha256": sha256_file(path),
             }
         )
-        print(json.dumps({"event": "reference_window_written", **manifest["windows"][-1]}), flush=True)
+        print(
+            json.dumps(
+                {
+                    "event": "prefill_capture_window_written",
+                    "role": args.role,
+                    **manifest["windows"][-1],
+                }
+            ),
+            flush=True,
+        )
         del output, logits
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
@@ -260,7 +281,17 @@ def main():
     with open(destination / "manifest.json", "w") as handle:
         json.dump(manifest, handle, indent=2, sort_keys=True)
         handle.write("\n")
-    print(json.dumps({"event": "reference_capture_complete", "windows": len(manifest["windows"]), "output_dir": str(destination)}), flush=True)
+    print(
+        json.dumps(
+            {
+                "event": "prefill_capture_complete",
+                "role": args.role,
+                "windows": len(manifest["windows"]),
+                "output_dir": str(destination),
+            }
+        ),
+        flush=True,
+    )
 
 
 if __name__ == "__main__":
