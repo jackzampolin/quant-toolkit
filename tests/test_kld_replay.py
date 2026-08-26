@@ -5,6 +5,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
+import numpy as np
 import torch
 from safetensors.torch import save_file
 
@@ -39,9 +40,31 @@ class KldReplayTests(unittest.TestCase):
             )
             input_ids = torch.tensor([2, 3, 5, 7, 11, 13, 17, 19], dtype=torch.int32)
 
-            def write_capture(directory, logits, role, run_label):
+            def write_capture(
+                directory, logits, role, run_label, external_tokens=False
+            ):
                 path = directory / "logits_0.safetensors"
-                save_file({"logits": logits, "input_ids": input_ids}, str(path))
+                tensors = {"logits": logits}
+                record = {
+                    "index": 0,
+                    "file": path.name,
+                }
+                if external_tokens:
+                    token_path = directory / "input_ids_0.npy"
+                    np.save(token_path, input_ids.numpy(), allow_pickle=False)
+                    record.update(
+                        {
+                            "input_ids_file": token_path.name,
+                            "input_ids_file_sha256": sha256_file(token_path),
+                            "input_ids_canonical_sha256": canonical_json_sha256(
+                                input_ids.to(torch.int64).tolist()
+                            ),
+                        }
+                    )
+                else:
+                    tensors["input_ids"] = input_ids
+                save_file(tensors, str(path))
+                record["sha256"] = sha256_file(path)
                 token_sha = canonical_json_sha256(input_ids.to(torch.int64).tolist())
                 manifest = {
                     "schema": "quant-toolkit.prefill-logits.v1",
@@ -52,20 +75,20 @@ class KldReplayTests(unittest.TestCase):
                     "storage_dtype": "float32",
                     "token_sha256": token_sha,
                     "engine_request": {"kv_cache_dtype": "bfloat16"},
-                    "windows": [
-                        {
-                            "index": 0,
-                            "file": path.name,
-                            "sha256": sha256_file(path),
-                        }
-                    ],
+                    "windows": [record],
                 }
                 manifest["manifest_sha256"] = canonical_json_sha256(manifest)
                 (directory / "manifest.json").write_text(
                     json.dumps(manifest, indent=2, sort_keys=True) + "\n"
                 )
 
-            write_capture(reference_dir, reference, "canonical", "bf16-tp8-bf16-kv")
+            write_capture(
+                reference_dir,
+                reference,
+                "canonical",
+                "bf16-tp8-bf16-kv",
+                external_tokens=True,
+            )
             write_capture(candidate_dir, candidate, "candidate", "fp8-tp4-bf16-kv")
             self.assertEqual(
                 compare_captured_main(
@@ -102,6 +125,8 @@ class KldReplayTests(unittest.TestCase):
                 verification["schema"],
                 "quant-toolkit.captured-prefill-kld-verification.v1",
             )
+            self.assertIn("p99_9", summary["aggregate"]["kld_nats"])
+            self.assertIn("p99_9", verification["aggregate"]["kld_nats"])
             self.assertLessEqual(verification["max_tokenwise_kld_difference"], 1e-12)
 
     def test_full_artifact_replay(self):

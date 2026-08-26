@@ -12,6 +12,7 @@ import json
 import math
 from pathlib import Path
 
+import numpy as np
 import torch
 import torch.nn.functional as F
 
@@ -32,6 +33,62 @@ def sha256_file(path: str | Path, chunk_bytes: int = 16 * 1024 * 1024) -> str:
         while chunk := handle.read(chunk_bytes):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def canonical_token_ids_sha256(token_ids: torch.Tensor) -> str:
+    """Hash a one-dimensional token array independent of its integer width."""
+    if token_ids.ndim != 1:
+        raise ValueError(
+            f"input token IDs must be rank 1, got {tuple(token_ids.shape)}"
+        )
+    if token_ids.dtype == torch.bool or token_ids.is_floating_point():
+        raise ValueError(f"input token IDs must be integers, got {token_ids.dtype}")
+    return canonical_json_sha256(token_ids.to(torch.int64).tolist())
+
+
+def load_capture_input_ids(
+    directory: str | Path,
+    record: dict,
+    tensors: dict[str, torch.Tensor],
+) -> torch.Tensor:
+    """Load embedded or externally sealed input IDs for a capture window."""
+    if "input_ids" in tensors:
+        token_ids = tensors["input_ids"]
+    else:
+        relative_path = record.get("input_ids_file")
+        if not relative_path:
+            raise ValueError(
+                "capture window has neither embedded nor external input_ids"
+            )
+        path = Path(directory) / relative_path
+        expected_file_sha256 = record.get("input_ids_file_sha256")
+        if not expected_file_sha256:
+            raise ValueError(f"external input IDs have no file hash: {path}")
+        if sha256_file(path) != expected_file_sha256:
+            raise ValueError(f"external input-token hash mismatch: {path}")
+        if path.suffix == ".npy":
+            array = np.load(path, allow_pickle=False)
+            if not np.issubdtype(array.dtype, np.integer):
+                raise ValueError(f"input token IDs must be integers: {path}")
+            token_ids = torch.from_numpy(np.asarray(array))
+        elif path.suffix == ".safetensors":
+            from safetensors.torch import load_file
+
+            external_tensors = load_file(path)
+            if "input_ids" not in external_tensors:
+                raise ValueError(f"external token artifact has no input_ids: {path}")
+            token_ids = external_tensors["input_ids"]
+        else:
+            raise ValueError(f"unsupported external token artifact: {path}")
+
+    observed_canonical_sha256 = canonical_token_ids_sha256(token_ids)
+    expected_canonical_sha256 = record.get("input_ids_canonical_sha256")
+    if (
+        expected_canonical_sha256
+        and observed_canonical_sha256 != expected_canonical_sha256
+    ):
+        raise ValueError("canonical input-token identity mismatch")
+    return token_ids
 
 
 def sampling_params_for_prompt_logits(SamplingParams):
@@ -132,7 +189,9 @@ def tokenwise_kld(
                 log_ref,
                 reduction="none",
                 log_target=True,
-            ).sum(dim=-1).to(torch.float64)
+            )
+            .sum(dim=-1)
+            .to(torch.float64)
         )
         ref_top1.append(ref.argmax(dim=-1).to(torch.int64))
         candidate_top1.append(cand.argmax(dim=-1).to(torch.int64))
@@ -159,6 +218,7 @@ def summarize_kld(
             "median": float(torch.quantile(values, 0.5)),
             "p95": float(torch.quantile(values, 0.95)),
             "p99": float(torch.quantile(values, 0.99)),
+            "p99_9": float(torch.quantile(values, 0.999)),
             "max": float(values.max()),
         }
 

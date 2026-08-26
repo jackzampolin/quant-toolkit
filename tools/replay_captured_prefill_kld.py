@@ -36,6 +36,53 @@ def sha256_file(path: str | Path, chunk_bytes: int = 16 * 1024 * 1024) -> str:
     return digest.hexdigest()
 
 
+def _canonical_token_ids_sha256(token_ids: np.ndarray) -> str:
+    if token_ids.ndim != 1:
+        raise ValueError(f"input token IDs must be rank 1, got {token_ids.shape}")
+    if not np.issubdtype(token_ids.dtype, np.integer):
+        raise ValueError(f"input token IDs must be integers, got {token_ids.dtype}")
+    return canonical_json_sha256(token_ids.astype(np.int64).tolist())
+
+
+def _load_capture_input_ids(
+    directory: Path,
+    record: dict,
+    tensors: dict[str, np.ndarray],
+) -> np.ndarray:
+    if "input_ids" in tensors:
+        token_ids = tensors["input_ids"]
+    else:
+        relative_path = record.get("input_ids_file")
+        if not relative_path:
+            raise ValueError(
+                "capture window has neither embedded nor external input_ids"
+            )
+        path = directory / relative_path
+        expected_file_sha256 = record.get("input_ids_file_sha256")
+        if not expected_file_sha256:
+            raise ValueError(f"external input IDs have no file hash: {path}")
+        if sha256_file(path) != expected_file_sha256:
+            raise ValueError(f"external input-token hash mismatch: {path}")
+        if path.suffix == ".npy":
+            token_ids = np.load(path, allow_pickle=False)
+        elif path.suffix == ".safetensors":
+            external_tensors = load_file(str(path))
+            if "input_ids" not in external_tensors:
+                raise ValueError(f"external token artifact has no input_ids: {path}")
+            token_ids = external_tensors["input_ids"]
+        else:
+            raise ValueError(f"unsupported external token artifact: {path}")
+
+    observed_canonical_sha256 = _canonical_token_ids_sha256(token_ids)
+    expected_canonical_sha256 = record.get("input_ids_canonical_sha256")
+    if (
+        expected_canonical_sha256
+        and observed_canonical_sha256 != expected_canonical_sha256
+    ):
+        raise ValueError("canonical input-token identity mismatch")
+    return token_ids
+
+
 def _verify_seal(document: dict, field: str, label: str) -> None:
     body = {key: value for key, value in document.items() if key != field}
     if document.get(field) != canonical_json_sha256(body):
@@ -113,6 +160,7 @@ def _stats(values: np.ndarray) -> dict:
         "median": float(np.median(values)),
         "p95": float(np.quantile(values, 0.95)),
         "p99": float(np.quantile(values, 0.99)),
+        "p99_9": float(np.quantile(values, 0.999)),
         "max": float(np.max(values)),
     }
 
@@ -209,13 +257,27 @@ def main(argv: list[str] | None = None) -> int:
 
         reference_tensors = load_file(str(reference_path))
         candidate_tensors = load_file(str(candidate_path))
+        reference_input_ids = _load_capture_input_ids(
+            reference_dir, reference_record, reference_tensors
+        )
+        candidate_input_ids = _load_capture_input_ids(
+            candidate_dir, candidate_record, candidate_tensors
+        )
+        for label, tensors, input_ids in (
+            ("reference", reference_tensors, reference_input_ids),
+            ("candidate", candidate_tensors, candidate_input_ids),
+        ):
+            expected_tokens = int(tensors["logits"].shape[0]) + 1
+            if input_ids.size != expected_tokens:
+                raise ValueError(
+                    f"{label} token/logit row alignment mismatch in window {index}"
+                )
         if not np.array_equal(
-            reference_tensors["input_ids"], candidate_tensors["input_ids"]
+            reference_input_ids.astype(np.int64),
+            candidate_input_ids.astype(np.int64),
         ):
             raise ValueError(f"input token mismatch in window {index}")
-        input_ids_sha = canonical_json_sha256(
-            reference_tensors["input_ids"].astype(np.int64).tolist()
-        )
+        input_ids_sha = _canonical_token_ids_sha256(reference_input_ids)
         if input_ids_sha != report_record.get("input_ids_sha256"):
             raise ValueError(f"report input-token identity mismatch: {index}")
 

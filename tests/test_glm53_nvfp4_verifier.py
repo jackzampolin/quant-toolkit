@@ -1,0 +1,125 @@
+import json
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+
+import torch
+from safetensors.torch import save_file
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
+
+from verify_glm53_nvfp4_checkpoint import main as verify_main
+
+
+class Glm53Nvfp4VerifierTests(unittest.TestCase):
+    def _write_checkpoint(self, directory: Path, tensors: dict, config: dict) -> None:
+        directory.mkdir()
+        shard = "model-00001-of-00001.safetensors"
+        save_file(tensors, directory / shard)
+        index = {
+            "metadata": {},
+            "weight_map": {key: shard for key in sorted(tensors)},
+        }
+        (directory / "model.safetensors.index.json").write_text(
+            json.dumps(index) + "\n"
+        )
+        (directory / "config.json").write_text(json.dumps(config) + "\n")
+
+    def _fixtures(self, root: Path) -> tuple[Path, Path]:
+        source = root / "source"
+        candidate = root / "candidate"
+        config = {
+            "architectures": ["Glm5NextForConditionalGeneration"],
+            "text_config": {
+                "first_k_dense_replace": 1,
+                "num_hidden_layers": 2,
+                "n_routed_experts": 2,
+            },
+        }
+        source_tensors = {"model.language_model.norm.weight": torch.ones(16)}
+        for layer in (1, 2):
+            for expert in range(2):
+                for projection in ("gate_proj", "up_proj", "down_proj"):
+                    key = (
+                        f"model.language_model.layers.{layer}.mlp.experts."
+                        f"{expert}.{projection}.weight"
+                    )
+                    source_tensors[key] = torch.ones((16, 16), dtype=torch.bfloat16)
+        self._write_checkpoint(source, source_tensors, config)
+
+        candidate_tensors = {}
+        for key, tensor in source_tensors.items():
+            if ".layers.1.mlp.experts." not in key:
+                candidate_tensors[key] = tensor
+                continue
+            prefix = key.removesuffix(".weight")
+            candidate_tensors[key] = torch.zeros((16, 8), dtype=torch.uint8)
+            candidate_tensors[prefix + ".weight_scale"] = torch.ones(
+                (16, 1), dtype=torch.float8_e4m3fn
+            )
+            candidate_tensors[prefix + ".weight_scale_2"] = torch.tensor(0.25)
+            candidate_tensors[prefix + ".input_scale"] = torch.tensor(0.5)
+        candidate_config = dict(config)
+        candidate_config["quantization_config"] = {"quant_algo": "NVFP4"}
+        self._write_checkpoint(candidate, candidate_tensors, candidate_config)
+        return source, candidate
+
+    def test_exact_routed_coverage_and_seal(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source, candidate = self._fixtures(root)
+            report_path = root / "report.json"
+            self.assertEqual(
+                verify_main(
+                    [
+                        "--source-model",
+                        str(source),
+                        "--candidate-model",
+                        str(candidate),
+                        "--source-revision",
+                        "b" * 40,
+                        "--candidate-name",
+                        "synthetic",
+                        "--output",
+                        str(report_path),
+                    ]
+                ),
+                0,
+            )
+            report = json.loads(report_path.read_text())
+            self.assertEqual(report["coverage"]["quantized_weight_tensors"], 6)
+            self.assertEqual(report["coverage"]["quantized_parameters"], 1536)
+            self.assertTrue(report["coverage"]["gate_up_weight_scale_2_tied"])
+            self.assertEqual(len(report["report_sha256"]), 64)
+
+    def test_untied_gate_up_scale_fails_closed(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source, candidate = self._fixtures(root)
+            shard = candidate / "model-00001-of-00001.safetensors"
+            from safetensors.torch import load_file
+
+            tensors = load_file(shard)
+            key = "model.language_model.layers.1.mlp.experts.0.up_proj.weight_scale_2"
+            tensors[key] = torch.tensor(0.5)
+            save_file(tensors, shard)
+            with self.assertRaisesRegex(ValueError, "not tied"):
+                verify_main(
+                    [
+                        "--source-model",
+                        str(source),
+                        "--candidate-model",
+                        str(candidate),
+                        "--source-revision",
+                        "b" * 40,
+                        "--candidate-name",
+                        "synthetic",
+                        "--output",
+                        str(root / "report.json"),
+                    ]
+                )
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -1,0 +1,41 @@
+diff --git a/vllm/v1/worker/gpu/model_runner.py b/vllm/v1/worker/gpu/model_runner.py
+--- a/vllm/v1/worker/gpu/model_runner.py
++++ b/vllm/v1/worker/gpu/model_runner.py
+@@ -96,1 +96,4 @@
++from vllm.v1.worker.gpu.distribution_capture import (
++    capture_pre_lm_head_prompt_hidden_states,
++)
+ from vllm.v1.worker.gpu.dp_utils import dispatch_cg_and_sync_dp
+@@ -1834,4 +1837,11 @@
+         # Last rank: sample tokens
++        assert hidden_states is not None
++        capture_pre_lm_head_prompt_hidden_states(
++            self.model,
++            hidden_states,
++            input_batch,
++            self.req_states.prompt_len.np,
++        )
+         hidden_states, input_batch = pcp.maybe_restore_pcp_for_sampling(
+             self.pcp_manager, hidden_states, input_batch
+         )
+diff --git a/vllm/models/glm5next/nvidia/model.py b/vllm/models/glm5next/nvidia/model.py
+--- a/vllm/models/glm5next/nvidia/model.py
++++ b/vllm/models/glm5next/nvidia/model.py
+@@ -969,1 +969,8 @@
++    def compute_pre_lm_head_hidden_states(
++        self,
++        hidden_states: torch.Tensor,
++    ) -> torch.Tensor:
++        """Return states after the final RMSNorm and before the LM head."""
++        return hidden_states
++
+     def compute_logits(
+@@ -1024,1 +1031,8 @@
++    def compute_pre_lm_head_hidden_states(
++        self,
++        hidden_states: torch.Tensor,
++    ) -> torch.Tensor:
++        """Expose final-normalized language-model states to capture tooling."""
++        return self.language_model.compute_pre_lm_head_hidden_states(hidden_states)
++
+     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):

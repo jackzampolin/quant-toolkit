@@ -69,8 +69,7 @@ def independent_tokenwise_kld(
         target_log_probability = target_shift - np.log(target_partition)
         observed_log_probability = observed_shift - np.log(observed_partition)
         result[start:stop] = np.sum(
-            target_probability
-            * (target_log_probability - observed_log_probability),
+            target_probability * (target_log_probability - observed_log_probability),
             axis=1,
         )
         reference_top1[start:stop] = np.argmax(target, axis=1)
@@ -90,6 +89,7 @@ def _stats(values: np.ndarray) -> dict:
         "median": float(np.median(values)),
         "p95": float(np.quantile(values, 0.95)),
         "p99": float(np.quantile(values, 0.99)),
+        "p99_9": float(np.quantile(values, 0.999)),
         "max": float(np.max(values)),
     }
 
@@ -129,7 +129,10 @@ def main(argv: list[str] | None = None) -> int:
     _verify_seal(reference_manifest, "manifest_sha256", "reference manifest")
     _verify_seal(candidate_summary, "summary_sha256", "candidate summary")
     embedded_reference = candidate_summary.get("reference_manifest", {})
-    if embedded_reference.get("manifest_sha256") != reference_manifest["manifest_sha256"]:
+    if (
+        embedded_reference.get("manifest_sha256")
+        != reference_manifest["manifest_sha256"]
+    ):
         raise ValueError("candidate summary references a different teacher manifest")
     if reference_manifest.get("storage_dtype") != "float32":
         raise ValueError("independent NumPy replay requires float32 reference logits")
@@ -279,7 +282,11 @@ def main(argv: list[str] | None = None) -> int:
         json.dumps(verification, indent=2, sort_keys=True) + "\n",
         encoding="utf-8",
     )
-    print(json.dumps({"event": "independent_kld_replay_complete", **verification["aggregate"]}))
+    print(
+        json.dumps(
+            {"event": "independent_kld_replay_complete", **verification["aggregate"]}
+        )
+    )
     return 0
 
 

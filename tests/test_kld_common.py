@@ -21,6 +21,7 @@ class KldCommonTests(unittest.TestCase):
         summary = summarize_kld(values, reference_top1, candidate_top1)
         self.assertEqual(summary["direction"], "KL(reference||candidate)")
         self.assertEqual(summary["top1_agreement"], 1.0)
+        self.assertEqual(summary["kld_nats"]["p99_9"], 0.0)
 
     def test_known_bernoulli_kld_and_bits(self):
         reference = torch.log(torch.tensor([[0.75, 0.25]], dtype=torch.float64))
@@ -71,9 +72,7 @@ class KldCommonTests(unittest.TestCase):
                 reference.numpy(), candidate.numpy(), chunk_rows=5
             )
         )
-        self.assertTrue(
-            np.allclose(produced.numpy(), replayed, rtol=0.0, atol=1e-12)
-        )
+        self.assertTrue(np.allclose(produced.numpy(), replayed, rtol=0.0, atol=1e-12))
         self.assertTrue(np.array_equal(reference_top1.numpy(), replay_reference_top1))
         self.assertTrue(np.array_equal(candidate_top1.numpy(), replay_candidate_top1))
 

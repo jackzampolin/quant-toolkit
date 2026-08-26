@@ -18,6 +18,28 @@ checkpoint near 195-205 GB after NVFP4 block scales and preserved tensors. Do
 not widen coverage based only on local reconstruction error; use BF16-teacher
 KLD to qualify each candidate.
 
+Before loading an exported candidate, verify the exact fail-closed coverage,
+packed tensor shapes/dtypes, positive finite scales, tied gate/up global
+scales, protected BF16 MTP layer, and absence of any unexpected quantized
+tensors. The full shard-hash pass is the release receipt:
+
+```bash
+uv run --no-config --no-project --python 3.12 \
+  --with torch --with safetensors \
+  python tools/verify_glm53_nvfp4_checkpoint.py \
+  --source-model /data/models/GLM-5.3-Flash-BF16-b1967181 \
+  --candidate-model /data/models/GLM-5.3-Flash-NVFP4-routed \
+  --source-revision b1967181a3917ae70a437f4884748f6b8e3a1f4d \
+  --candidate-name glm53-flash-nvfp4-routed-v1 \
+  --hash-candidate-shards \
+  --output /data/kld/runtimes/glm53-flash-nvfp4-routed-v1.coverage.json
+```
+
+For the pinned BF16 source the verifier must report exactly 36,288 quantized
+weight tensors and 304,405,807,104 quantized parameters (94.7351% of the
+321,323,031,390-parameter checkpoint). The resulting tensor payload is
+205,063,596,408 bytes before safetensors headers.
+
 ## Dense-prefill KLD
 
 The campaign workflow is capture once, compare many. Every weight/topology/KV
@@ -32,6 +54,89 @@ independent replay, and reporting. Workstation-1 and workstation-2 are reserved
 for distributed model inference and logit capture; copy sealed captures away
 before running the offline tools. Do not overlap a workstation CPU analysis job
 with a GPU model run.
+
+### Pinned GLM-5.3 campaign path
+
+The pinned cstech OpenAI server does not expose a practical dense-logit HTTP
+response. `prompt_logprobs=-1` would materialize the full vocabulary through
+Python objects and JSON. For this campaign, capture the final-normalized BF16
+hidden rows with the derivative overlay, then replay the common protected BF16
+LM head into float32 safetensors. Normal serving is unchanged when capture is
+disabled.
+
+The external teacher dataset is pinned at
+`brandonmusic/GLM-5.3-Flash-BF16-Teacher-Logits@417504ebcb1a81645e651bc8c0e8009827d36e8b`.
+Its 25 F32 windows contain 51,175 prediction positions. The source BF16 model
+revision is `a6c167b62691b2bac901344b65cb651a70f53e43`; all 120 weight shards,
+`config.json`, and the tensor index are byte-identical to the lab's pinned
+`b1967181a3917ae70a437f4884748f6b8e3a1f4d` checkpoint. The published
+`token-panel-receipt.json` currently records token hashes but not the token
+payloads. Import deliberately fails until `panel.json`, the
+`arrays/final-*.tokens.npy` files, and `arrays/causal-mask-2048.npy` are present.
+
+Import the teacher without copying its 31.7 GB logit payload:
+
+```bash
+uv run --no-config --no-project --python 3.12 \
+  --with torch --with 'numpy>=2.0' --with safetensors \
+  python tools/import_glm53_teacher_logits.py \
+  --dataset-dir /data/GLM-5.3-Flash-BF16-Teacher-Logits \
+  --token-panel-dir /data/GLM-5.3-Flash-token-panel-v1 \
+  --output-dir /data/kld/captures/bf16-transformers-teacher
+```
+
+Build the capture image from the exact base digest:
+
+```bash
+docker build \
+  -t local/glm53-cstech-hidden-capture:base-0bd709e-capture-v1 \
+  overlays/cstech-glm53-hidden-capture
+```
+
+The first verified build produced image ID
+`sha256:9e123d5f1677bade647356dd07e48cdacd9f4537ede1a4921e4ef1996417fd06`.
+After launching that image with an empty writable capture mount and
+`VLLM_KLD_HIDDEN_CAPTURE_DIR`, capture the exact teacher token suite:
+
+```bash
+uv run --no-config --no-project --python 3.12 \
+  --with torch --with 'numpy>=2.0' --with safetensors --with requests \
+  python tools/capture_glm53_hidden_suite.py \
+  --suite-manifest /data/kld/captures/bf16-transformers-teacher/manifest.json \
+  --capture-dir /data/kld/raw-hidden/fp8-tp4-fp8-ds-mla \
+  --output-dir /data/kld/hidden/fp8-tp4-fp8-ds-mla \
+  --runtime-manifest /data/kld/runtimes/fp8-tp4-fp8-ds-mla.json \
+  --run-name fp8-tp4-fp8-ds-mla
+```
+
+Export the shared head once from the pinned BF16 checkpoint, then reconstruct
+every candidate capture. Run the projection on a GPU only after unloading the
+serving model; the output remains float32.
+
+```bash
+uv run --no-config --no-project --python 3.12 \
+  --with torch --with safetensors \
+  python tools/export_glm53_lm_head.py \
+  --model-dir /data/models/GLM-5.3-Flash-BF16-b1967181 \
+  --model-revision b1967181a3917ae70a437f4884748f6b8e3a1f4d \
+  --output-dir /data/kld/lm-head-b1967181
+
+uv run --no-config --no-project --python 3.12 \
+  --with torch --with safetensors \
+  python tools/replay_glm53_hidden_logits.py \
+  --hidden-dir /data/kld/hidden/fp8-tp4-fp8-ds-mla \
+  --lm-head-dir /data/kld/lm-head-b1967181 \
+  --output-dir /data/kld/captures/fp8-tp4-fp8-ds-mla \
+  --device cuda:0
+```
+
+The external no-cache/eager BF16 teacher is a clean weight-and-attention
+reference, but it is not evidence for a BF16 KV-cache policy. Keep that
+distinction explicit in the final comparison.
+
+The direct in-process path below remains available for a runtime that supports
+both BF16 KV and dense prompt-logit return. It is not runnable against the
+current pinned sparse-MLA SM120 server.
 
 Capture the canonical BF16-weights/BF16-KV run:
 
@@ -86,8 +191,8 @@ uv run --no-project --with 'numpy>=2.0' --with safetensors \
   --output-dir /data/kld/verifications/bf16-bf16__fp8-fp8-ds-mla
 ```
 
-Reports contain tokenwise KLD plus mean, median, p95, p99, maximum, and top-1
-agreement. The direction is always `KL(reference || candidate)`, in both nats
+Reports contain tokenwise KLD plus mean, median, p95, p99, p99.9, maximum, and
+top-1 agreement. The direction is always `KL(reference || candidate)`, in both nats
 and bits. The vLLM build must expose `return_prompt_logits` or the lab's flat
 full-logprob fallback. `score_prefill_kld.py` and `replay_prefill_kld.py` remain
 available for one-off live comparisons, but they are not the preferred campaign
@@ -112,6 +217,46 @@ follows:
 scaling per 16 NVFP4 values by reconstruction error. Do not record an NVFP4 KV
 result until backend selection and the startup log prove a distinct supported
 layout.
+
+The machine-readable support record, including exact image/source hashes,
+parser choices, backend aliases, and the 656-byte tensor layout, is
+`manifests/glm5_3_flash_cstech_kv_support_0bd709e.json`.
+
+The exact two-node BF16 control launcher is
+`scripts/run_glm53_cstech_node.sh`. Start the worker first from
+workstation-1's private-rail SSH path, then start the head locally:
+
+```bash
+ssh jack@10.42.20.2 \
+  'NODE_RANK=1 DCP_SIZE=1 /path/to/run_glm53_cstech_node.sh'
+NODE_RANK=0 DCP_SIZE=1 scripts/run_glm53_cstech_node.sh
+```
+
+Use `DCP_SIZE=4` for the requested capacity/control rerun. The launcher refuses
+unsupported KV dtype names and preserves the two-hour Gloo/NCCL startup
+timeouts needed for a cold 598.52-GiB checkpoint on workstation-2's ZFS pool.
+Do not force vLLM's whole-checkpoint prefetch there: the pinned build warns
+that the checkpoint exceeds 90% of available host RAM, and every rank would
+otherwise start a competing prefetch.
+
+For a hidden-state capture run, build the identical derivative image on both
+nodes, override the image on both ranks, and set the capture invariants
+explicitly. The launcher refuses unsafe mixes. Start the worker first:
+
+```bash
+ssh jack@10.42.20.2 \
+  'IMAGE=local/glm53-cstech-hidden-capture:base-0bd709e-capture-v1 \
+  EXPECTED_IMAGE_ID=sha256:9e123d5f1677bade647356dd07e48cdacd9f4537ede1a4921e4ef1996417fd06 \
+  CAPTURE_DIR=/data/kld/raw-hidden/bf16-tp8-dcp1-fp8-ds-mla \
+  MAX_NUM_SEQS=1 PREFIX_CACHING=0 MTP_TOKENS=0 \
+  NODE_RANK=1 DCP_SIZE=1 /path/to/run_glm53_cstech_node.sh'
+
+IMAGE=local/glm53-cstech-hidden-capture:base-0bd709e-capture-v1 \
+EXPECTED_IMAGE_ID=sha256:9e123d5f1677bade647356dd07e48cdacd9f4537ede1a4921e4ef1996417fd06 \
+CAPTURE_DIR=/data/kld/raw-hidden/bf16-tp8-dcp1-fp8-ds-mla \
+MAX_NUM_SEQS=1 PREFIX_CACHING=0 MTP_TOKENS=0 \
+NODE_RANK=0 DCP_SIZE=1 scripts/run_glm53_cstech_node.sh
+```
 
 For the TP4 campaign, use this order:
 

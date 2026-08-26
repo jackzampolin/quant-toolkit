@@ -13,6 +13,7 @@ from pathlib import Path
 import torch
 from kld_common import (
     canonical_json_sha256,
+    load_capture_input_ids,
     sha256_file,
     summarize_kld,
     tokenwise_kld,
@@ -118,8 +119,23 @@ def main(argv: list[str] | None = None) -> int:
 
         reference_tensors = load_file(reference_path)
         candidate_tensors = load_file(candidate_path)
+        reference_input_ids = load_capture_input_ids(
+            reference_dir, reference_record, reference_tensors
+        )
+        candidate_input_ids = load_capture_input_ids(
+            candidate_dir, candidate_record, candidate_tensors
+        )
+        for label, tensors, input_ids in (
+            ("reference", reference_tensors, reference_input_ids),
+            ("candidate", candidate_tensors, candidate_input_ids),
+        ):
+            expected_tokens = int(tensors["logits"].shape[0]) + 1
+            if input_ids.numel() != expected_tokens:
+                raise ValueError(
+                    f"{label} token/logit row alignment mismatch in window {index}"
+                )
         if not torch.equal(
-            reference_tensors["input_ids"], candidate_tensors["input_ids"]
+            reference_input_ids.to(torch.int64), candidate_input_ids.to(torch.int64)
         ):
             raise ValueError(f"input token mismatch in window {index}")
         kld, reference_top1, candidate_top1 = tokenwise_kld(
@@ -137,7 +153,7 @@ def main(argv: list[str] | None = None) -> int:
                 "candidate_file": candidate_record["file"],
                 "candidate_file_sha256": candidate_sha,
                 "input_ids_sha256": canonical_json_sha256(
-                    reference_tensors["input_ids"].to(torch.int64).tolist()
+                    reference_input_ids.to(torch.int64).tolist()
                 ),
             }
         )
