@@ -71,8 +71,9 @@ revision is `a6c167b62691b2bac901344b65cb651a70f53e43`; all 120 weight shards,
 `config.json`, and the tensor index are byte-identical to the lab's pinned
 `b1967181a3917ae70a437f4884748f6b8e3a1f4d` checkpoint. The pinned dataset
 now includes the sealed panel, the 25 held-out
-`final-*.tokens.npy` payloads, and their causal mask. The mirror verifies the
-token files against the hashes in the teacher manifest before import.
+held-out `final-*.tokens.npy` payloads, all fit/selection/conditional-fit/
+confirmation token payloads, and their causal mask. The mirror verifies all
+665 token files against the hashes in the sealed panel before import.
 
 Import the teacher without copying its 31.7 GB logit payload:
 

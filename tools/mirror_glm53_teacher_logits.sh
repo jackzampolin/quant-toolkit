@@ -139,18 +139,31 @@ if [[ "$(jq -r '.schema' "${panel_dir}/panel.json")" != "quant-pipeline.glm53-to
   exit 6
 fi
 
-# Only the held-out final windows feed the published KLD comparison. Fetch
-# them by the hashes sealed into the teacher manifest instead of trusting a
-# mutable directory listing.
+# Mirror every sealed calibration role so quantization never needs to retokenize
+# Brandon's corpus. The final 25 still remain qualification-only.
 fetch_file \
   "calibration/panel-v1/arrays/causal-mask-2048.npy" \
-  "$(jq -r '.windows[] | select(.role == "final") | .attention_mask_sha256' "${panel_dir}/panel.json" | sort -u)" \
+  "$(jq -r '.windows[].attention_mask_sha256' "${panel_dir}/panel.json" | sort -u)" \
   2176
-jq -r '.logit_files[] | ["calibration/panel-v1/arrays/" + .window_id + ".tokens.npy", .token_ids_sha256, "8320"] | @tsv' \
-  "${destination}/dataset-manifest.json" \
-  | while IFS=$'\t' read -r relative_path expected_sha256 expected_bytes; do
-      fetch_file "${relative_path}" "${expected_sha256}" "${expected_bytes}"
-    done
+# The positional parameters intentionally expand inside each child shell.
+# shellcheck disable=SC2016
+jq -r '.windows[] | ["calibration/panel-v1/arrays/" + .window_id + ".tokens.npy", .token_ids_sha256, "8320"] | @tsv' \
+  "${panel_dir}/panel.json" \
+  | xargs -P "${parallel_downloads}" -n 3 bash -c 'fetch_file "$1" "$2" "$3"' _
+
+verified_token_windows=0
+verified_token_bytes=0
+while IFS=$'\t' read -r relative_path expected_sha256 expected_bytes; do
+  final_path="${destination}/${relative_path}"
+  actual_bytes="$(stat -c %s "${final_path}")"
+  actual_sha256="$(sha256sum "${final_path}" | awk '{print $1}')"
+  if [[ "${actual_bytes}" != "${expected_bytes}" || "${actual_sha256}" != "${expected_sha256}" ]]; then
+    echo "post-download verification failed for ${relative_path}" >&2
+    exit 7
+  fi
+  verified_token_windows=$((verified_token_windows + 1))
+  verified_token_bytes=$((verified_token_bytes + actual_bytes))
+done < <(jq -r '.windows[] | ["calibration/panel-v1/arrays/" + .window_id + ".tokens.npy", .token_ids_sha256, "8320"] | @tsv' "${panel_dir}/panel.json")
 
 if [[ "$(jq -r '.schema' "${destination}/dataset-manifest.json")" != "quant-pipeline.glm53-bf16-teacher-logits-dataset.v1" ]]; then
   echo "unexpected dataset manifest schema" >&2
@@ -192,6 +205,9 @@ jq -n \
   --arg dataset_manifest_sha256 "$(sha256sum "${destination}/dataset-manifest.json" | awk '{print $1}')" \
   --arg capture_receipt_sha256 "$(sha256sum "${destination}/capture-receipt.json" | awk '{print $1}')" \
   --arg token_panel_receipt_sha256 "$(sha256sum "${destination}/token-panel-receipt.json" | awk '{print $1}')" \
+  --arg panel_sha256 "$(sha256sum "${panel_dir}/panel.json" | awk '{print $1}')" \
+  --argjson verified_token_windows "${verified_token_windows}" \
+  --argjson verified_token_bytes "${verified_token_bytes}" \
   --argjson verified_windows "${verified_windows}" \
   --argjson verified_bytes "${verified_bytes}" \
   '{
@@ -203,6 +219,9 @@ jq -n \
     dataset_manifest_sha256: $dataset_manifest_sha256,
     capture_receipt_sha256: $capture_receipt_sha256,
     token_panel_receipt_sha256: $token_panel_receipt_sha256,
+    panel_sha256: $panel_sha256,
+    verified_token_windows: $verified_token_windows,
+    verified_token_bytes: $verified_token_bytes,
     verified_windows: $verified_windows,
     verified_bytes: $verified_bytes
   }' >"${receipt_temporary}"
