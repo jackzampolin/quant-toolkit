@@ -20,6 +20,7 @@ from safetensors.torch import load_file, save_file
 
 HIDDEN_SCHEMA = "quant-toolkit.prefill-hidden.v1"
 LOGIT_SCHEMA = "quant-toolkit.prefill-logits.v1"
+TEACHER_DATASET_SCHEMA = "quant-pipeline.glm53-bf16-teacher-logits-dataset.v1"
 CHUNK_RE = re.compile(r"hidden\.rows-(\d+)-(\d+)\.safetensors$")
 
 
@@ -197,6 +198,14 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--url", default="http://127.0.0.1:8000/v1/completions")
     parser.add_argument("--model", default="GLM-5.3-Flash-BF16")
     parser.add_argument("--suite-manifest", type=Path, required=True)
+    parser.add_argument(
+        "--token-panel-dir",
+        type=Path,
+        help=(
+            "Published panel.json/arrays directory. Required only when the suite "
+            "manifest is Brandon's teacher dataset manifest."
+        ),
+    )
     parser.add_argument("--capture-dir", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--runtime-manifest", type=Path, required=True)
@@ -212,9 +221,29 @@ def main(argv: list[str] | None = None) -> int:
     suite = json.loads(suite_path.read_text(encoding="utf-8"))
     if suite.get("schema") == LOGIT_SCHEMA:
         _verify_manifest_seal(suite, "suite")
-    records = suite.get("windows", suite.get("contexts"))
+    if suite.get("schema") == TEACHER_DATASET_SCHEMA:
+        if args.token_panel_dir is None:
+            parser.error("--token-panel-dir is required for a teacher dataset manifest")
+        suite_dir = args.token_panel_dir.resolve()
+        records = []
+        for source in suite.get("logit_files", []):
+            record = dict(source)
+            record["index"] = len(records)
+            record["input_ids_file"] = f"arrays/{source['window_id']}.tokens.npy"
+            record["input_ids_file_sha256"] = source["token_ids_sha256"]
+            records.append(record)
+    else:
+        records = suite.get("windows", suite.get("contexts"))
     if not isinstance(records, list) or not records:
         raise RuntimeError("suite manifest contains no windows")
+    suite_token_sha256 = suite.get("token_sha256")
+    if not suite_token_sha256:
+        suite_token_sha256 = canonical_json_sha256(
+            [
+                canonical_token_ids_sha256(_load_suite_token_ids(suite_dir, record))
+                for record in records
+            ]
+        )
     stop = len(records) if args.stop_window is None else args.stop_window
     selected = records[args.start_window : stop]
     if not selected:
@@ -239,7 +268,7 @@ def main(argv: list[str] | None = None) -> int:
             "storage_dtype": "bfloat16",
             "semantic_point": "after_final_rmsnorm_before_lm_head",
             "suite_manifest_file_sha256": sha256_file(suite_path),
-            "token_sha256": suite.get("token_sha256"),
+            "token_sha256": suite_token_sha256,
             "runtime_manifest": str(runtime_path),
             "runtime_manifest_file_sha256": runtime_sha256,
             "windows": [],

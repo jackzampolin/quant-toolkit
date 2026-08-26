@@ -65,14 +65,14 @@ LM head into float32 safetensors. Normal serving is unchanged when capture is
 disabled.
 
 The external teacher dataset is pinned at
-`brandonmusic/GLM-5.3-Flash-BF16-Teacher-Logits@417504ebcb1a81645e651bc8c0e8009827d36e8b`.
+`brandonmusic/GLM-5.3-Flash-BF16-Teacher-Logits@17ffa06d2ee899b6043c3307bc572bc944ed5ea5`.
 Its 25 F32 windows contain 51,175 prediction positions. The source BF16 model
 revision is `a6c167b62691b2bac901344b65cb651a70f53e43`; all 120 weight shards,
 `config.json`, and the tensor index are byte-identical to the lab's pinned
-`b1967181a3917ae70a437f4884748f6b8e3a1f4d` checkpoint. The published
-`token-panel-receipt.json` currently records token hashes but not the token
-payloads. Import deliberately fails until `panel.json`, the
-`arrays/final-*.tokens.npy` files, and `arrays/causal-mask-2048.npy` are present.
+`b1967181a3917ae70a437f4884748f6b8e3a1f4d` checkpoint. The pinned dataset
+now includes the sealed panel, the 25 held-out
+`final-*.tokens.npy` payloads, and their causal mask. The mirror verifies the
+token files against the hashes in the teacher manifest before import.
 
 Import the teacher without copying its 31.7 GB logit payload:
 
@@ -81,7 +81,7 @@ uv run --no-config --no-project --python 3.12 \
   --with torch --with 'numpy>=2.0' --with safetensors \
   python tools/import_glm53_teacher_logits.py \
   --dataset-dir /data/GLM-5.3-Flash-BF16-Teacher-Logits \
-  --token-panel-dir /data/GLM-5.3-Flash-token-panel-v1 \
+  --token-panel-dir /data/GLM-5.3-Flash-BF16-Teacher-Logits/calibration/panel-v1 \
   --output-dir /data/kld/captures/bf16-transformers-teacher
 ```
 
@@ -102,7 +102,8 @@ After launching that image with an empty writable capture mount and
 uv run --no-config --no-project --python 3.12 \
   --with torch --with 'numpy>=2.0' --with safetensors --with requests \
   python tools/capture_glm53_hidden_suite.py \
-  --suite-manifest /data/kld/captures/bf16-transformers-teacher/manifest.json \
+  --suite-manifest /data/GLM-5.3-Flash-BF16-Teacher-Logits/dataset-manifest.json \
+  --token-panel-dir /data/GLM-5.3-Flash-BF16-Teacher-Logits/calibration/panel-v1 \
   --capture-dir /data/kld/raw-hidden/fp8-tp4-fp8-ds-mla \
   --output-dir /data/kld/hidden/fp8-tp4-fp8-ds-mla \
   --runtime-manifest /data/kld/runtimes/fp8-tp4-fp8-ds-mla.json \
@@ -235,9 +236,14 @@ NODE_RANK=0 DCP_SIZE=1 scripts/run_glm53_cstech_node.sh
 Use `DCP_SIZE=4` for the requested capacity/control rerun. The launcher refuses
 unsupported KV dtype names and preserves the two-hour Gloo/NCCL startup
 timeouts needed for a cold 598.52-GiB checkpoint on workstation-2's ZFS pool.
-Do not force vLLM's whole-checkpoint prefetch there: the pinned build warns
-that the checkpoint exceeds 90% of available host RAM, and every rank would
-otherwise start a competing prefetch.
+The cold DCP1 control took 2143.02 seconds to load its main weights because
+automatic prefetch was disabled and the demand-fault path only drove the
+three-drive ZFS stripe at roughly 130--170 MiB/s. The pinned implementation's
+explicit prefetch path is rank-sharded (`sorted_files[rank::world_size]`), not
+a whole-checkpoint read by every rank. Future launches therefore default to
+`SAFETENSORS_LOAD_STRATEGY=prefetch`, eight threads per rank, and 16-MiB
+blocks. Set `SAFETENSORS_LOAD_STRATEGY=auto` only when reproducing the cold
+control. Record the host ARC cap and load strategy in each run receipt.
 
 For a hidden-state capture run, build the identical derivative image on both
 nodes, override the image on both ranks, and set the capture invariants

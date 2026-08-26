@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Launch one node of the pinned two-host GLM-5.3-Flash cstech runtime.
-# Start node rank 1 first, then node rank 0. The pinned sparse-SM120 backend
-# currently supports only the effective fp8_ds_mla cache layout.
+# Launch either the pinned two-host BF16 TP8 runtime or the single-host TP4
+# runtime used for official-FP8 and NVFP4 capture. For two hosts, start node
+# rank 1 before node rank 0. The pinned sparse-SM120 backend currently supports
+# only the effective fp8_ds_mla cache layout.
 
 IMAGE="${IMAGE:-cstechdev/vllm@sha256:0bd709e80b8ff13ae5de8f7d7f708a499fade3a26970d56afb1be2ff3860fde5}"
 MODEL_DIR="${MODEL_DIR:-/data/models/GLM-5.3-Flash-BF16-b1967181}"
@@ -31,6 +32,9 @@ READY_TIMEOUT_SECONDS="${READY_TIMEOUT_SECONDS:-7200}"
 DISTRIBUTED_TIMEOUT_SECONDS="${DISTRIBUTED_TIMEOUT_SECONDS:-7200}"
 CPU_DISTRIBUTED_TIMEOUT_SECONDS="${CPU_DISTRIBUTED_TIMEOUT_SECONDS:-7200}"
 KV_CACHE_DTYPE="${KV_CACHE_DTYPE:-fp8}"
+SAFETENSORS_LOAD_STRATEGY="${SAFETENSORS_LOAD_STRATEGY:-prefetch}"
+SAFETENSORS_PREFETCH_NUM_THREADS="${SAFETENSORS_PREFETCH_NUM_THREADS:-8}"
+SAFETENSORS_PREFETCH_BLOCK_SIZE="${SAFETENSORS_PREFETCH_BLOCK_SIZE:-16777216}"
 CAPTURE_DIR="${CAPTURE_DIR:-}"
 EXPECTED_IMAGE_ID="${EXPECTED_IMAGE_ID:-}"
 
@@ -49,16 +53,33 @@ case "${NODE_RANK}" in
     ;;
 esac
 
-if [[ "${NNODES}" != 2 || "${TP_SIZE}" != 8 ]]; then
-  echo "This sealed campaign launcher requires NNODES=2 and TP_SIZE=8." >&2
-  exit 2
-fi
+case "${NNODES}:${TP_SIZE}" in
+  2:8) ;;
+  1:4)
+    if [[ "${NODE_RANK}" != 0 ]]; then
+      echo "The single-host TP4 runtime requires NODE_RANK=0." >&2
+      exit 2
+    fi
+    ;;
+  *)
+    echo "This sealed campaign launcher requires NNODES=2/TP_SIZE=8 or NNODES=1/TP_SIZE=4." >&2
+    exit 2
+    ;;
+esac
 if ((DCP_SIZE < 1 || TP_SIZE % DCP_SIZE != 0)); then
   echo "DCP_SIZE must be a positive divisor of TP_SIZE." >&2
   exit 2
 fi
 if [[ "${KV_CACHE_DTYPE}" != fp8 ]]; then
   echo "The pinned sparse-SM120 backend only supports effective fp8_ds_mla; requested ${KV_CACHE_DTYPE}." >&2
+  exit 2
+fi
+if [[ "${SAFETENSORS_LOAD_STRATEGY}" != auto && "${SAFETENSORS_LOAD_STRATEGY}" != prefetch ]]; then
+  echo "SAFETENSORS_LOAD_STRATEGY must be auto or prefetch." >&2
+  exit 2
+fi
+if ((SAFETENSORS_PREFETCH_NUM_THREADS < 1 || SAFETENSORS_PREFETCH_BLOCK_SIZE < 1)); then
+  echo "Safetensors prefetch thread count and block size must be positive." >&2
   exit 2
 fi
 if [[ ! "${PREFIX_CACHING}" =~ ^[01]$ ]]; then
@@ -114,6 +135,14 @@ if ((MTP_TOKENS > 0)); then
     "{\"method\":\"mtp\",\"num_speculative_tokens\":${MTP_TOKENS}}"
   )
 fi
+load_args=()
+if [[ "${SAFETENSORS_LOAD_STRATEGY}" == prefetch ]]; then
+  load_args=(
+    --safetensors-load-strategy prefetch
+    --safetensors-prefetch-num-threads "${SAFETENSORS_PREFETCH_NUM_THREADS}"
+    --safetensors-prefetch-block-size "${SAFETENSORS_PREFETCH_BLOCK_SIZE}"
+  )
+fi
 
 docker run -d \
   --name "${CONTAINER_NAME}" \
@@ -154,6 +183,7 @@ docker run -d \
   --distributed-executor-backend mp \
   --distributed-timeout-seconds "${DISTRIBUTED_TIMEOUT_SECONDS}" \
   --cpu-distributed-timeout-seconds "${CPU_DISTRIBUTED_TIMEOUT_SECONDS}" \
+  "${load_args[@]}" \
   --disable-custom-all-reduce \
   --max-num-seqs "${MAX_NUM_SEQS}" \
   --max-model-len "${MAX_MODEL_LEN}" \
@@ -173,5 +203,6 @@ Started ${CONTAINER_NAME} (node rank ${NODE_RANK})
 Image: ${IMAGE}
 Model revision: ${MODEL_REVISION}
 TP=${TP_SIZE} DCP=${DCP_SIZE} effective KV=fp8_ds_mla
+Safetensors load strategy: ${SAFETENSORS_LOAD_STRATEGY}
 Image ID: ${ACTUAL_IMAGE_ID}
 EOF

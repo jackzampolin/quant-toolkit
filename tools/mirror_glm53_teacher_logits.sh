@@ -6,7 +6,7 @@ set -euo pipefail
 # and is promoted from .incomplete only after size and SHA-256 verification.
 
 readonly REPO="brandonmusic/GLM-5.3-Flash-BF16-Teacher-Logits"
-readonly REVISION="417504ebcb1a81645e651bc8c0e8009827d36e8b"
+readonly REVISION="17ffa06d2ee899b6043c3307bc572bc944ed5ea5"
 readonly DEFAULT_DESTINATION="/volume1/models/hf/datasets--brandonmusic--GLM-5.3-Flash-BF16-Teacher-Logits/snapshots/${REVISION}"
 
 destination="${1:-${GLM53_TEACHER_DESTINATION:-${DEFAULT_DESTINATION}}}"
@@ -117,6 +117,11 @@ export -f fetch_file
 readonly metadata_files=(
   README.md
   backend.json
+  calibration/panel-v1/calibration.sealed-corpus.json
+  calibration/panel-v1/corpus.receipt.json
+  calibration/panel-v1/panel.json
+  calibration/panel-v1/panel.receipt.json
+  calibration/panel-v1/tokenizer.receipt.json
   capture-receipt.json
   dataset-manifest.json
   plan.json
@@ -127,6 +132,25 @@ readonly metadata_files=(
 for metadata_file in "${metadata_files[@]}"; do
   fetch_file "${metadata_file}"
 done
+
+readonly panel_dir="${destination}/calibration/panel-v1"
+if [[ "$(jq -r '.schema' "${panel_dir}/panel.json")" != "quant-pipeline.glm53-token-panel.v1" ]]; then
+  echo "unexpected token panel schema" >&2
+  exit 6
+fi
+
+# Only the held-out final windows feed the published KLD comparison. Fetch
+# them by the hashes sealed into the teacher manifest instead of trusting a
+# mutable directory listing.
+fetch_file \
+  "calibration/panel-v1/arrays/causal-mask-2048.npy" \
+  "$(jq -r '.windows[] | select(.role == "final") | .attention_mask_sha256' "${panel_dir}/panel.json" | sort -u)" \
+  2176
+jq -r '.logit_files[] | ["calibration/panel-v1/arrays/" + .window_id + ".tokens.npy", .token_ids_sha256, "8320"] | @tsv' \
+  "${destination}/dataset-manifest.json" \
+  | while IFS=$'\t' read -r relative_path expected_sha256 expected_bytes; do
+      fetch_file "${relative_path}" "${expected_sha256}" "${expected_bytes}"
+    done
 
 if [[ "$(jq -r '.schema' "${destination}/dataset-manifest.json")" != "quant-pipeline.glm53-bf16-teacher-logits-dataset.v1" ]]; then
   echo "unexpected dataset manifest schema" >&2
