@@ -144,6 +144,14 @@ if ((MTP_TOKENS > 0)); then
     "{\"method\":\"mtp\",\"num_speculative_tokens\":${MTP_TOKENS}}"
   )
 fi
+headless_args=()
+if [[ "${NNODES}" == 2 && "${NODE_RANK}" != 0 ]]; then
+  # vLLM's multi-node multiprocess executor requires every non-head TP node
+  # to run without an API server.  Without this, the follower constructs an
+  # EngineCore and fails during KV initialization because collective_rpc is
+  # valid only on the head node.
+  headless_args=(--headless)
+fi
 load_args=()
 if [[ "${SAFETENSORS_LOAD_STRATEGY}" == prefetch ]]; then
   load_args=(
@@ -205,6 +213,7 @@ docker run -d \
   --tool-call-parser glm47 \
   --reasoning-parser glm45 \
   --default-chat-template-kwargs '{"reasoning_effort":"max"}' \
+  "${headless_args[@]}" \
   "${speculative_args[@]}"
 
 cat <<EOF
