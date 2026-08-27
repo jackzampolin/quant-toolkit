@@ -1212,7 +1212,9 @@ else:
 
     print("\nExporting quantized model to HF format...")
     prepare_fn = loader.prepare_export if loader is not None else None
+    source_dir = loader.snapshot_dir if loader is not None else None
     export_hf(model, export_dir=args.export_dir, prepare_fn=prepare_fn,
               extra_mtp_prefixes=cfg.extra_mtp_prefixes,
-              preserve_remote_code=cfg.preserve_remote_code)
+              preserve_remote_code=cfg.preserve_remote_code,
+              source_dir=source_dir)
     print(f"Quantized model exported to {args.export_dir}")
