@@ -978,6 +978,7 @@ class StreamingModelLoader:
         """Load a meta layer's weights for export (to CPU, with expert unfusing)."""
         del model
         self._materialize_layer_module(module, layer_idx, "cpu")
+        _calibrate_meta_weight_amaxes(module)
 
     def _materialize_layer_module(self, module, layer_idx, device):
         """Load one decoder layer into an already-created module tree."""
@@ -1215,6 +1216,50 @@ def _init_rotary_buffer(module, buffer_name, device):
     return None
 
 
+def _calibrate_meta_weight_amaxes(module):
+    """Recompute weight amaxes that ModelOpt initialized from meta weights.
+
+    Disk-backed layers are still meta when ModelOpt runs its global weight-only
+    calibration pass.  Once their immutable weights are materialized, replace
+    those placeholder amaxes using the same max-calibration routine ModelOpt
+    uses for ordinary resident weights.
+    """
+    from modelopt.torch.quantization.model_calib import max_calibrate
+    from modelopt.torch.quantization.nn import TensorQuantizer
+
+    calibrated = 0
+    for child in module.modules():
+        quantizer = getattr(child, "weight_quantizer", None)
+        weight = getattr(child, "weight", None)
+        if not isinstance(quantizer, TensorQuantizer) or not quantizer.is_enabled:
+            continue
+        amax = getattr(quantizer, "_amax", None)
+        if not isinstance(amax, torch.Tensor) or amax.device.type != "meta":
+            continue
+        if not isinstance(weight, torch.Tensor) or weight.device.type == "meta":
+            raise RuntimeError(
+                "Cannot calibrate a lazy weight amax without materialized weight data"
+            )
+        calibrator = getattr(quantizer, "_calibrator", None)
+        if calibrator is None or not hasattr(calibrator, "reset"):
+            raise RuntimeError("Lazy weight amax requires a resettable ModelOpt calibrator")
+        calibrator.reset()
+        # TensorQuantizer's setter copies into an existing buffer.  A copy into
+        # a meta buffer remains meta, so unregister the placeholder first and
+        # let load_calib_amax create a real buffer on the weight device.
+        delattr(quantizer, "_amax")
+        max_calibrate(
+            quantizer,
+            lambda current, value=weight: current(value),
+            distributed_sync=False,
+        )
+        resolved = getattr(quantizer, "_amax", None)
+        if not isinstance(resolved, torch.Tensor) or resolved.device.type == "meta":
+            raise RuntimeError("Lazy weight amax remained meta after calibration")
+        calibrated += 1
+    return calibrated
+
+
 class LayerStreamingHook:
     """Forward hooks that stream a decoder layer's weights to GPU 0 for execution."""
 
@@ -1227,6 +1272,12 @@ class LayerStreamingHook:
         """Copy or load layer weights to GPU 0 before forward pass."""
         if self.storage_device == "meta":
             self._load_from_disk(module)
+            calibrated = _calibrate_meta_weight_amaxes(module)
+            if calibrated:
+                print(
+                    f"  Layer {self.layer_idx}: calibrated {calibrated} "
+                    "lazy weight amax(es)"
+                )
             # _load_from_disk only loads checkpoint weights. After mtq.quantize
             # attaches TensorQuantizer modules, their buffers (_amax, _pre_quant_scale,
             # etc.) live on CPU (preserved there by _unload_to_meta). We need to
