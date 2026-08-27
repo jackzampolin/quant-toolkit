@@ -335,6 +335,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--roles", nargs="+", default=["fit", "conditional-fit"])
     parser.add_argument("--samples-per-expert", type=int, default=256)
     parser.add_argument("--devices", default="cuda:0,cuda:1,cuda:2,cuda:3")
+    parser.add_argument(
+        "--phase",
+        choices=("all", "route-maps", "conditional"),
+        default="all",
+        help="Run both phases, only route-map replay, or only CUDA replay.",
+    )
     args = parser.parse_args(argv)
 
     source_model = args.source_model.resolve()
@@ -350,7 +356,7 @@ def main(argv: list[str] | None = None) -> int:
     intermediate_size = int(config["moe_intermediate_size"])
     swiglu_limit = float(config["swiglu_limit"])
     devices = [value.strip() for value in args.devices.split(",") if value.strip()]
-    if not devices:
+    if args.phase != "route-maps" and not devices:
         raise ValueError("--devices must name at least one CUDA device")
     if args.samples_per_expert <= 0 or not math.isfinite(
         float(args.samples_per_expert)
@@ -432,9 +438,10 @@ def main(argv: list[str] | None = None) -> int:
         return records
 
     conditional_records = []
-    with ThreadPoolExecutor(max_workers=len(devices)) as executor:
-        for records in executor.map(worker, range(len(devices))):
-            conditional_records.extend(records)
+    if args.phase != "route-maps":
+        with ThreadPoolExecutor(max_workers=len(devices)) as executor:
+            for records in executor.map(worker, range(len(devices))):
+                conditional_records.extend(records)
 
     receipt = {
         "schema": SCHEMA,
@@ -445,6 +452,7 @@ def main(argv: list[str] | None = None) -> int:
         },
         "evidence_manifests": evidence_manifests,
         "method": {
+            "phase": args.phase,
             "roles": args.roles,
             "samples_per_expert": args.samples_per_expert,
             "reservoir_selection_verified_byte_exact": True,
@@ -466,7 +474,7 @@ def main(argv: list[str] | None = None) -> int:
         "tools": {
             "augment_sha256": sha256_file(Path(__file__).resolve()),
         },
-        "result": "PASS",
+        "result": "PASS" if args.phase != "route-maps" else "PASS_ROUTE_MAPS",
     }
     receipt["receipt_sha256"] = canonical_json_sha256(receipt)
     _write_json_atomic(args.receipt, receipt)
