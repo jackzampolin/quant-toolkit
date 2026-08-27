@@ -63,6 +63,39 @@ def _docker_inspect(container: str) -> dict:
     return values[0]
 
 
+def _command_value(command: list[str], flag: str, cast):
+    try:
+        index = command.index(flag)
+    except ValueError as exc:
+        raise RuntimeError(f"runtime command is missing {flag}") from exc
+    if index + 1 >= len(command):
+        raise RuntimeError(f"runtime command has no value after {flag}")
+    return cast(command[index + 1])
+
+
+def _runtime_fields(command: list[str]) -> dict:
+    return {
+        "tensor_parallel_size": _command_value(
+            command, "--tensor-parallel-size", int
+        ),
+        "decode_context_parallel_size": _command_value(
+            command, "--decode-context-parallel-size", int
+        ),
+        "kv_cache_requested": _command_value(command, "--kv-cache-dtype", str),
+        "kv_cache_effective": "fp8_ds_mla",
+        "max_model_len": _command_value(command, "--max-model-len", int),
+        "max_num_seqs": _command_value(command, "--max-num-seqs", int),
+        "max_num_batched_tokens": _command_value(
+            command, "--max-num-batched-tokens", int
+        ),
+        "gpu_memory_utilization": _command_value(
+            command, "--gpu-memory-utilization", float
+        ),
+        "prefix_caching": "--enable-prefix-caching" in command,
+        "enforce_eager": "--enforce-eager" in command,
+    }
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--container", required=True)
@@ -73,15 +106,31 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--output", required=True, type=Path)
     parser.add_argument("--source-revision", required=True)
     parser.add_argument("--dataset-revision", required=True)
-    parser.add_argument("--coverage-receipt", required=True, type=Path)
-    parser.add_argument("--scale-install-receipt", required=True, type=Path)
-    parser.add_argument("--scale-construction-receipt", required=True, type=Path)
+    parser.add_argument(
+        "--quantization-family",
+        choices=("nvfp4", "official-fp8", "bf16"),
+        default="nvfp4",
+    )
+    parser.add_argument("--coverage-receipt", type=Path)
+    parser.add_argument("--scale-install-receipt", type=Path)
+    parser.add_argument("--scale-construction-receipt", type=Path)
     parser.add_argument("--weight-patch-receipt", type=Path)
     parser.add_argument("--quant-toolkit-commit", required=True)
     parser.add_argument("--capture-tool", required=True, type=Path)
     parser.add_argument("--replay-tool", required=True, type=Path)
-    parser.add_argument("--input-scale-scope", required=True)
+    parser.add_argument("--input-scale-scope")
     args = parser.parse_args(argv)
+
+    nvfp4_required = {
+        "--coverage-receipt": args.coverage_receipt,
+        "--scale-install-receipt": args.scale_install_receipt,
+        "--scale-construction-receipt": args.scale_construction_receipt,
+        "--input-scale-scope": args.input_scale_scope,
+    }
+    if args.quantization_family == "nvfp4":
+        missing = [flag for flag, value in nvfp4_required.items() if value is None]
+        if missing:
+            parser.error(f"NVFP4 runtime requires {', '.join(missing)}")
 
     candidate = args.candidate_model.resolve()
     panel_path = args.panel_dir / "panel.json"
@@ -104,9 +153,6 @@ def main(argv: list[str] | None = None) -> int:
         raise RuntimeError(f"container is not running: {args.container}")
     config = inspect.get("Config", {})
     image_id = inspect.get("Image")
-    coverage = _load_json(args.coverage_receipt)
-    install = _load_json(args.scale_install_receipt)
-    construction = _load_json(args.scale_construction_receipt)
     command = config.get("Cmd") or []
 
     runtime = {
@@ -115,36 +161,12 @@ def main(argv: list[str] | None = None) -> int:
         "run_name": args.run_name,
         "model": {
             "checkpoint_path": str(candidate),
-            "bf16_source_revision": args.source_revision,
+            "checkpoint_revision": args.source_revision,
+            "quantization_family": args.quantization_family,
             "config_sha256": sha256_file(candidate / "config.json"),
             "index_sha256": sha256_file(
                 candidate / "model.safetensors.index.json"
             ),
-            "input_scale_sha256": sha256_file(
-                candidate / "model-inputscales.safetensors"
-            ),
-            "coverage_receipt": {
-                "path": str(args.coverage_receipt.resolve()),
-                "file_sha256": sha256_file(args.coverage_receipt),
-                "quantized_weight_tensors": coverage["coverage"][
-                    "quantized_weight_tensors"
-                ],
-                "quantized_parameters": coverage["coverage"][
-                    "quantized_parameters"
-                ],
-                "candidate_tensor_bytes": coverage["candidate"]["tensor_bytes"],
-            },
-            "scale_install_receipt": {
-                "path": str(args.scale_install_receipt.resolve()),
-                "file_sha256": sha256_file(args.scale_install_receipt),
-                "receipt_sha256": install.get("receipt_sha256"),
-            },
-            "scale_construction_receipt": {
-                "path": str(args.scale_construction_receipt.resolve()),
-                "file_sha256": sha256_file(args.scale_construction_receipt),
-                "receipt_sha256": construction.get("receipt_sha256"),
-            },
-            "input_scale_scope": args.input_scale_scope,
         },
         "runtime": {
             "host": os.uname().nodename,
@@ -156,16 +178,7 @@ def main(argv: list[str] | None = None) -> int:
             "image_id": image_id,
             "entrypoint": config.get("Entrypoint"),
             "command": command,
-            "tensor_parallel_size": 4,
-            "decode_context_parallel_size": 1,
-            "kv_cache_requested": "fp8",
-            "kv_cache_effective": "fp8_ds_mla",
-            "max_model_len": 4096,
-            "max_num_seqs": 1,
-            "max_num_batched_tokens": 2048,
-            "gpu_memory_utilization": 0.90,
-            "prefix_caching": False,
-            "enforce_eager": True,
+            **_runtime_fields(command),
         },
         "suite": {
             "panel_path": str(panel_path.resolve()),
@@ -185,6 +198,42 @@ def main(argv: list[str] | None = None) -> int:
             "replay_tool_sha256": sha256_file(args.replay_tool),
         },
     }
+    if args.quantization_family == "nvfp4":
+        coverage = _load_json(args.coverage_receipt)
+        install = _load_json(args.scale_install_receipt)
+        construction = _load_json(args.scale_construction_receipt)
+        runtime["model"].update(
+            {
+                "bf16_source_revision": args.source_revision,
+                "input_scale_sha256": sha256_file(
+                    candidate / "model-inputscales.safetensors"
+                ),
+                "coverage_receipt": {
+                    "path": str(args.coverage_receipt.resolve()),
+                    "file_sha256": sha256_file(args.coverage_receipt),
+                    "quantized_weight_tensors": coverage["coverage"][
+                        "quantized_weight_tensors"
+                    ],
+                    "quantized_parameters": coverage["coverage"][
+                        "quantized_parameters"
+                    ],
+                    "candidate_tensor_bytes": coverage["candidate"][
+                        "tensor_bytes"
+                    ],
+                },
+                "scale_install_receipt": {
+                    "path": str(args.scale_install_receipt.resolve()),
+                    "file_sha256": sha256_file(args.scale_install_receipt),
+                    "receipt_sha256": install.get("receipt_sha256"),
+                },
+                "scale_construction_receipt": {
+                    "path": str(args.scale_construction_receipt.resolve()),
+                    "file_sha256": sha256_file(args.scale_construction_receipt),
+                    "receipt_sha256": construction.get("receipt_sha256"),
+                },
+                "input_scale_scope": args.input_scale_scope,
+            }
+        )
     if args.weight_patch_receipt is not None:
         weight_patch = _load_json(args.weight_patch_receipt)
         runtime["model"]["weight_patch_receipt"] = {
