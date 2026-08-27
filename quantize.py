@@ -18,6 +18,7 @@ import modelopt.torch.quantization as mtq
 import logging
 
 from models import load_config, AVAILABLE_MODELS
+from quant_config_compat import compose_quant_config
 from models.mimo_v25_visual import (
     build_mimo_processor,
     precompute_mimo_visual_embeds_for_batches,
@@ -182,6 +183,11 @@ if ATTN_IMPLEMENTATION is not None:
     print(f"Using attention implementation: {ATTN_IMPLEMENTATION}")
 
 cfg.register_moe()
+qcfg = compose_quant_config(
+    mtq.NVFP4_DEFAULT_CFG,
+    cfg.get_all_quant_overrides(),
+    calibration_method=args.calib_method,
+)
 
 tokenizer = AutoTokenizer.from_pretrained(MODEL_ID, trust_remote_code=TRUST_REMOTE)
 if tokenizer.pad_token is None:
@@ -1010,20 +1016,6 @@ def forward_loop(m):
 # ---------------------------------------------------------------------------
 # Quantize.
 # ---------------------------------------------------------------------------
-
-base_qcfg = copy.deepcopy(mtq.NVFP4_DEFAULT_CFG)
-qcfg = copy.deepcopy(base_qcfg)
-for pattern, override in cfg.get_all_quant_overrides().items():
-    if override == {"enable": True}:
-        if pattern.endswith("weight_quantizer"):
-            override = copy.deepcopy(base_qcfg["quant_cfg"]["*weight_quantizer"])
-        elif pattern.endswith("input_quantizer"):
-            override = copy.deepcopy(base_qcfg["quant_cfg"]["*input_quantizer"])
-    qcfg["quant_cfg"][pattern] = override
-
-if args.calib_method == "quantile":
-    qcfg["algorithm"] = "quantile"
-    qcfg["quant_cfg"]["*input_quantizer"]["calibrator"] = "quantile"
 
 print(f"\nQuantizing with NVFP4 (model={args.model}, calib={args.calib_method})...")
 model = mtq.quantize(model, qcfg, forward_loop)
