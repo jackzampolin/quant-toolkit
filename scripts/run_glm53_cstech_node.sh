@@ -39,6 +39,7 @@ SAFETENSORS_LOAD_STRATEGY="${SAFETENSORS_LOAD_STRATEGY:-prefetch}"
 SAFETENSORS_PREFETCH_NUM_THREADS="${SAFETENSORS_PREFETCH_NUM_THREADS:-8}"
 SAFETENSORS_PREFETCH_BLOCK_SIZE="${SAFETENSORS_PREFETCH_BLOCK_SIZE:-16777216}"
 CAPTURE_DIR="${CAPTURE_DIR:-}"
+ROUTED_CAPTURE_DIR="${ROUTED_CAPTURE_DIR:-}"
 EXPECTED_IMAGE_ID="${EXPECTED_IMAGE_ID:-}"
 
 case "${NODE_RANK}" in
@@ -93,12 +94,21 @@ if ((MTP_TOKENS < 0)); then
   echo "MTP_TOKENS must be non-negative." >&2
   exit 2
 fi
-if [[ -n "${CAPTURE_DIR}" ]]; then
+if [[ -n "${CAPTURE_DIR}" || -n "${ROUTED_CAPTURE_DIR}" ]]; then
   if [[ "${PREFIX_CACHING}" != 0 || "${MTP_TOKENS}" != 0 || "${MAX_NUM_SEQS}" != 1 ]]; then
     echo "Capture requires PREFIX_CACHING=0, MTP_TOKENS=0, and MAX_NUM_SEQS=1." >&2
     exit 2
   fi
+fi
+if [[ -n "${CAPTURE_DIR}" ]]; then
   mkdir -p "${CAPTURE_DIR}"
+fi
+if [[ -n "${ROUTED_CAPTURE_DIR}" ]]; then
+  if [[ "${MAX_NUM_BATCHED_TOKENS}" != 2048 ]]; then
+    echo "Routed capture requires MAX_NUM_BATCHED_TOKENS=2048 for one complete panel window per step." >&2
+    exit 2
+  fi
+  mkdir -p "${ROUTED_CAPTURE_DIR}"
 fi
 if [[ ! -d "${MODEL_DIR}" ]]; then
   echo "Missing model directory: ${MODEL_DIR}" >&2
@@ -130,6 +140,17 @@ if [[ -n "${CAPTURE_DIR}" ]]; then
     -e VLLM_KLD_HIDDEN_CAPTURE_DIR=/capture-hidden
     -v "${CAPTURE_DIR}:/capture-hidden:rw"
   )
+fi
+routed_capture_args=()
+if [[ -n "${ROUTED_CAPTURE_DIR}" ]]; then
+  routed_capture_args=(
+    -e VLLM_GLM53_ROUTED_CAPTURE_DIR=/capture-routed
+    -v "${ROUTED_CAPTURE_DIR}:/capture-routed:rw"
+  )
+fi
+eager_args=()
+if [[ -n "${CAPTURE_DIR}" || -n "${ROUTED_CAPTURE_DIR}" ]]; then
+  eager_args=(--enforce-eager)
 fi
 prefix_args=()
 if [[ "${PREFIX_CACHING}" == 1 ]]; then
@@ -184,6 +205,7 @@ docker run -d \
   -e NCCL_RMA_PLUGIN=none \
   -e NCCL_GIN_PLUGIN=none \
   "${capture_args[@]}" \
+  "${routed_capture_args[@]}" \
   -v "${MODEL_MOUNT_SOURCE}:${MODEL_MOUNT_DEST}:ro" \
   -v "${CACHE_DIR}:/root/.cache" \
   "${IMAGE}" \
@@ -207,6 +229,7 @@ docker run -d \
   --max-num-batched-tokens "${MAX_NUM_BATCHED_TOKENS}" \
   --gpu-memory-utilization "${GPU_MEMORY_UTILIZATION}" \
   --kv-cache-dtype "${KV_CACHE_DTYPE}" \
+  "${eager_args[@]}" \
   "${prefix_args[@]}" \
   --no-enable-flashinfer-autotune \
   --enable-auto-tool-choice \

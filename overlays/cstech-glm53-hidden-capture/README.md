@@ -17,6 +17,15 @@ Enable capture by mounting an empty writable directory and setting:
 -e VLLM_KLD_HIDDEN_CAPTURE_DIR=/capture-hidden
 ```
 
+Routed-fit capture is independently enabled with
+`VLLM_GLM53_ROUTED_CAPTURE_DIR`. It requires eager execution, one request per
+step, and a full 2,048-token prefill in one scheduler step. Rank zero records
+the complete replicated BF16 MoE input before sequence-parallel chunking, FP32
+pre-sigmoid router logits, exact top-k IDs, and exact FP32 route weights for
+each routed layer. These factorized inputs retain cross-coordinate terms for
+offline float64 moment replay without storing dense per-expert covariance
+matrices.
+
 Capture runs must use one request at a time, no prefix caching, no speculative
 MTP, and exact pre-tokenized prompt IDs. The pinned launcher enforces this when
 `CAPTURE_DIR` is set (`MAX_NUM_SEQS=1 PREFIX_CACHING=0 MTP_TOKENS=0`). Rank zero

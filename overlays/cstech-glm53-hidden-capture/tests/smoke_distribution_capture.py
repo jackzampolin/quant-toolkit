@@ -9,7 +9,6 @@ from types import SimpleNamespace
 import numpy as np
 import torch
 from safetensors.torch import load_file
-
 from vllm.v1.worker.gpu import distribution_capture
 
 
@@ -18,6 +17,29 @@ class IdentityFinalNorm(torch.nn.Module):
         self, hidden_states: torch.Tensor
     ) -> torch.Tensor:
         return hidden_states
+
+
+class FakeRouter:
+    def select_experts(self, hidden_states, router_logits):
+        del hidden_states
+        weights, ids = torch.topk(router_logits.sigmoid(), k=2, dim=-1)
+        weights = weights / weights.sum(dim=-1, keepdim=True)
+        return weights.float(), ids.int()
+
+
+class FakeExperts:
+    layer_id = 3
+    router = FakeRouter()
+
+
+class FakeGate(torch.nn.Module):
+    def forward(self, hidden_states):
+        return hidden_states.float() @ torch.arange(12).reshape(4, 3).float(), None
+
+
+class FakeMoe(torch.nn.Module):
+    experts = FakeExperts()
+    gate = FakeGate()
 
 
 def make_batch(computed: int, scheduled: int) -> SimpleNamespace:
@@ -50,3 +72,24 @@ with tempfile.TemporaryDirectory() as temporary_directory:
     second_path = request_directory / "hidden.rows-000002-000005.safetensors"
     torch.testing.assert_close(load_file(first_path)["hidden_states"], first)
     torch.testing.assert_close(load_file(second_path)["hidden_states"], second)
+
+with tempfile.TemporaryDirectory() as temporary_directory:
+    os.environ["VLLM_GLM53_ROUTED_CAPTURE_DIR"] = temporary_directory
+    distribution_capture._is_capture_rank = lambda: True
+    distribution_capture.set_glm53_routed_capture_step_active(True)
+    hidden = torch.arange(20, dtype=torch.bfloat16).reshape(5, 4)
+    distribution_capture.capture_glm53_routed_evidence(FakeMoe(), hidden)
+    routed_path = (
+        Path(temporary_directory) / "pass-00000000" / "layer-0003.safetensors"
+    )
+    routed = load_file(routed_path)
+    assert set(routed) == {
+        "hidden_states",
+        "router_logits",
+        "topk_ids",
+        "topk_weights",
+    }
+    torch.testing.assert_close(routed["hidden_states"], hidden)
+    assert routed["router_logits"].shape == (5, 3)
+    assert routed["topk_ids"].dtype == torch.int16
+    assert routed["topk_weights"].dtype == torch.float32
