@@ -35,6 +35,7 @@ from models.mimo_v25_media import (
     video_audio_source,
     video_uses_audio,
 )
+from token_panel import build_token_panel_batches
 
 logging.basicConfig(
     level=logging.INFO,
@@ -796,7 +797,18 @@ def build_mm_batches(samples, max_len, batch_size):
 # Pre-build all batches, tagged with dataset index for logging.
 all_batches = []
 for ds_idx, ds in enumerate(calib_datasets):
-    if ds.get("multimodal", False):
+    if ds.get("format") == "token_panel":
+        role = ds.get("role")
+        if not role:
+            parser.error(f"token_panel dataset[{ds_idx}] requires a role")
+        ds_batches = build_token_panel_batches(
+            ds["path"],
+            role=role,
+            limit=ds.get("limit"),
+            max_len=ds.get("max_len"),
+            batch_size=ds["batch_size"],
+        )
+    elif ds.get("multimodal", False):
         ds_batches = list(build_mm_batches(
             iter_mm_samples(ds["path"], limit=ds.get("limit")),
             max_len=ds.get("max_len"),
