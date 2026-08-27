@@ -115,6 +115,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--scale-install-receipt", type=Path)
     parser.add_argument("--scale-construction-receipt", type=Path)
     parser.add_argument("--weight-patch-receipt", type=Path)
+    parser.add_argument("--precision-reserve-receipt", type=Path)
     parser.add_argument("--quant-toolkit-commit", required=True)
     parser.add_argument("--capture-tool", required=True, type=Path)
     parser.add_argument("--replay-tool", required=True, type=Path)
@@ -240,6 +241,13 @@ def main(argv: list[str] | None = None) -> int:
             "path": str(args.weight_patch_receipt.resolve()),
             "file_sha256": sha256_file(args.weight_patch_receipt),
             "receipt_sha256": weight_patch.get("receipt_sha256"),
+        }
+    if args.precision_reserve_receipt is not None:
+        precision_reserve = _load_json(args.precision_reserve_receipt)
+        runtime["model"]["precision_reserve_receipt"] = {
+            "path": str(args.precision_reserve_receipt.resolve()),
+            "file_sha256": sha256_file(args.precision_reserve_receipt),
+            "receipt_sha256": precision_reserve.get("receipt_sha256"),
         }
     runtime["runtime_sha256"] = canonical_json_sha256(runtime)
     _write_json_atomic(args.output, runtime)
