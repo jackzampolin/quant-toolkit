@@ -40,6 +40,21 @@ weight tensors and 304,405,807,104 quantized parameters (94.7351% of the
 321,323,031,390-parameter checkpoint). The resulting tensor payload is
 205,063,596,408 bytes before safetensors headers.
 
+Before replacing ModelOpt's reconstruction, prove that the local codec emits
+the serving format exactly. The audit re-encodes gate, up, and down from BF16,
+including the required shared gate/up secondary scale, and fails unless every
+packed nibble and scale is bit-identical to the stock checkpoint:
+
+```bash
+uv run --no-config --no-project --python 3.12 \
+  --with torch --with safetensors \
+  python tools/audit_glm53_nvfp4_codec.py \
+  --source-model /data/models/GLM-5.3-Flash-BF16-b1967181 \
+  --candidate-model /data/models/GLM-5.3-Flash-NVFP4-routed \
+  --layer 3 --expert 0 \
+  --output /data/kld/runtimes/glm53-nvfp4-codec-audit.json
+```
+
 ## Dense-prefill KLD
 
 The campaign workflow is capture once, compare many. Every weight/topology/KV
