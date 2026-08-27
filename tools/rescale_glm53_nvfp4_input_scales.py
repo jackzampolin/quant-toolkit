@@ -42,6 +42,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--receipt", type=Path, required=True)
     parser.add_argument("--gate-up-factor", type=float, required=True)
     parser.add_argument("--down-factor", type=float, required=True)
+    parser.add_argument("--gate-up-cap-quantile", type=float, default=1.0)
+    parser.add_argument("--down-cap-quantile", type=float, default=1.0)
     args = parser.parse_args(argv)
 
     for label, factor in (
@@ -50,13 +52,18 @@ def main(argv: list[str] | None = None) -> int:
     ):
         if not math.isfinite(factor) or factor <= 0:
             parser.error(f"{label} factor must be finite and positive")
+    for label, quantile in (
+        ("gate/up", args.gate_up_cap_quantile),
+        ("down", args.down_cap_quantile),
+    ):
+        if not math.isfinite(quantile) or not 0 < quantile <= 1:
+            parser.error(f"{label} cap quantile must be in (0, 1]")
     for destination in (args.output_scales, args.receipt):
         if destination.exists():
             raise FileExistsError(f"refusing to overwrite: {destination}")
 
     source = load_file(args.source_scales)
-    output: dict[str, torch.Tensor] = {}
-    projections: dict[tuple[int, int], dict[str, float]] = {}
+    scaled_values: dict[str, tuple[int, int, str, float]] = {}
     for key, tensor in source.items():
         match = SCALE_RE.fullmatch(key)
         if match is None:
@@ -68,12 +75,42 @@ def main(argv: list[str] | None = None) -> int:
         if not math.isfinite(value) or value <= 0:
             raise ValueError(f"input scale is not finite and positive: {key}")
         factor = args.down_factor if projection == "down_proj" else args.gate_up_factor
-        scaled = tensor * factor
-        scaled_value = float(scaled.item())
+        scaled_value = float((tensor * factor).item())
         if not math.isfinite(scaled_value) or scaled_value <= 0:
             raise ValueError(f"scaled input scale is invalid: {key}")
-        output[key] = scaled
-        projections.setdefault((int(layer), int(expert)), {})[projection] = scaled_value
+        scaled_values[key] = (int(layer), int(expert), projection, scaled_value)
+
+    group_values: dict[tuple[int, str], list[float]] = {}
+    for _key, (layer, _expert, projection, value) in scaled_values.items():
+        # Gate and up are tied, so count only gate once in their shared cap.
+        if projection == "up_proj":
+            continue
+        group = "down" if projection == "down_proj" else "gate_up"
+        group_values.setdefault((layer, group), []).append(value)
+    cap_quantiles = {
+        "gate_up": args.gate_up_cap_quantile,
+        "down": args.down_cap_quantile,
+    }
+    caps = {
+        identity: float(
+            torch.quantile(
+                torch.tensor(values, dtype=torch.float64),
+                cap_quantiles[identity[1]],
+            )
+        )
+        for identity, values in group_values.items()
+    }
+
+    output: dict[str, torch.Tensor] = {}
+    projections: dict[tuple[int, int], dict[str, float]] = {}
+    clipped_by_group = {"gate_up": 0, "down": 0}
+    for key, (layer, expert, projection, value) in scaled_values.items():
+        group = "down" if projection == "down_proj" else "gate_up"
+        capped = min(value, caps[(layer, group)])
+        if capped < value:
+            clipped_by_group[group] += 1
+        output[key] = torch.tensor(capped, dtype=torch.float32)
+        projections.setdefault((layer, expert), {})[projection] = float(output[key])
 
     for identity, values in projections.items():
         if set(values) != {"gate_proj", "up_proj", "down_proj"}:
@@ -96,7 +133,17 @@ def main(argv: list[str] | None = None) -> int:
         "method": {
             "gate_up_factor": args.gate_up_factor,
             "down_factor": args.down_factor,
-            "operation": "float32 scalar multiplication",
+            "gate_up_cap_quantile": args.gate_up_cap_quantile,
+            "down_cap_quantile": args.down_cap_quantile,
+            "operation": (
+                "float32 scalar multiplication followed by per-layer "
+                "expert-maximum quantile cap"
+            ),
+            "clipped_tensors": clipped_by_group,
+            "layer_caps": [
+                {"layer": layer, "projection_group": group, "cap": cap}
+                for (layer, group), cap in sorted(caps.items())
+            ],
         },
         "topology": {
             "experts": len(projections),
