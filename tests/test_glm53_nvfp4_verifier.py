@@ -37,7 +37,13 @@ class Glm53Nvfp4VerifierTests(unittest.TestCase):
                 "n_routed_experts": 2,
             },
         }
-        source_tensors = {"model.language_model.norm.weight": torch.ones(16)}
+        source_tensors = {
+            "model.language_model.norm.weight": torch.ones(16),
+            "model.language_model.layers.0.hc_attn_base": torch.ones(2),
+            "model.language_model.layers.0.self_attn.q_conv1d.weight": torch.ones((2, 4)),
+            "model.language_model.layers.0.self_attn.k_conv1d.weight": torch.ones((2, 4)),
+            "model.language_model.layers.0.self_attn.v_conv1d.weight": torch.ones((2, 4)),
+        }
         for layer in (1, 2):
             for expert in range(2):
                 for projection in ("gate_proj", "up_proj", "down_proj"):
@@ -48,8 +54,13 @@ class Glm53Nvfp4VerifierTests(unittest.TestCase):
                     source_tensors[key] = torch.ones((16, 16), dtype=torch.bfloat16)
         self._write_checkpoint(source, source_tensors, config)
 
-        candidate_tensors = {}
+        candidate_tensors = {
+            "model.language_model.layers.0.attn_hc.base": torch.ones(2),
+            "model.language_model.layers.0.self_attn.conv1d.weight": torch.ones((6, 4)),
+        }
         for key, tensor in source_tensors.items():
+            if key.startswith("model.language_model.layers.0."):
+                continue
             if ".layers.1.mlp.experts." not in key:
                 candidate_tensors[key] = tensor
                 continue
@@ -59,7 +70,6 @@ class Glm53Nvfp4VerifierTests(unittest.TestCase):
                 (16, 1), dtype=torch.float8_e4m3fn
             )
             candidate_tensors[prefix + ".weight_scale_2"] = torch.tensor(0.25)
-            candidate_tensors[prefix + ".input_scale"] = torch.tensor(0.5)
         candidate_config = dict(config)
         candidate_config["quantization_config"] = {"quant_algo": "NVFP4"}
         self._write_checkpoint(candidate, candidate_tensors, candidate_config)

@@ -18,7 +18,10 @@ class _Leaf(nn.Module):
 
 
 def _meta_parameter(shape):
-    return nn.Parameter(torch.empty(shape, device="meta"), requires_grad=False)
+    return nn.Parameter(
+        torch.empty(shape, device="meta", dtype=torch.bfloat16),
+        requires_grad=False,
+    )
 
 
 def _synthetic_glm_layer():
@@ -91,6 +94,8 @@ def test_glm53_layer_materialization_renames_and_fuses_qkv_conv():
         loader._materialize_layer_module(layer, 0, "cpu")
 
         assert not any(t.device.type == "meta" for t in layer.parameters())
+        assert layer.attn_hc.base.dtype == torch.float32
+        assert layer.self_attn.forget_gate.A_log.dtype == torch.float32
         assert torch.equal(layer.attn_hc.fn, tensors[prefix + "hc_attn_fn"])
         assert torch.equal(
             layer.self_attn.forget_gate.f_b_proj.weight,

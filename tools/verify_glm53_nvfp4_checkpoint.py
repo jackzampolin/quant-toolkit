@@ -9,10 +9,18 @@ import json
 import math
 import os
 import re
+import sys
 from collections import defaultdict
 from pathlib import Path
 
 from safetensors import safe_open
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from streaming_loader import (  # noqa: E402
+    _checkpoint_key_to_model_key,
+    _glm5_next_conv_target_key,
+)
 
 SCHEMA = "quant-toolkit.glm53-nvfp4-coverage.v1"
 BLOCK_SIZE = 16
@@ -161,13 +169,57 @@ def source_routed_keys(source_info: dict[str, dict], text_config: dict) -> list[
     return sorted(selected)
 
 
-def sidecar_keys(weight_key: str) -> tuple[str, str, str]:
+def sidecar_keys(weight_key: str) -> tuple[str, str]:
     prefix = weight_key.removesuffix(".weight")
     return (
         prefix + ".weight_scale",
         prefix + ".weight_scale_2",
-        prefix + ".input_scale",
     )
+
+
+def canonical_source_info(source_info: dict[str, dict], text_config: dict) -> dict[str, dict]:
+    """Map raw checkpoint tensors to the pinned Transformers model keyspace."""
+    protected_prefix = (
+        f"model.language_model.layers.{int(text_config['num_hidden_layers'])}."
+    )
+    canonical: dict[str, dict] = {}
+    fused: dict[str, dict[str, dict]] = defaultdict(dict)
+
+    for raw_key, info in source_info.items():
+        if raw_key.startswith(protected_prefix):
+            mapped = raw_key
+        else:
+            mapped = _checkpoint_key_to_model_key(raw_key)
+            glm_conv = _glm5_next_conv_target_key(mapped)
+            if glm_conv is not None:
+                target, part = glm_conv
+                fused[target][part] = info
+                continue
+        if mapped in canonical:
+            raise ValueError(f"checkpoint key mapping collision: {raw_key} -> {mapped}")
+        canonical[mapped] = dict(info)
+
+    required_parts = {"conv1d.weight": {"q", "k", "v"}}
+    for target, parts in fused.items():
+        suffix = next(
+            (name for name in required_parts if target.endswith(name)),
+            None,
+        )
+        if suffix is None or set(parts) != required_parts[suffix]:
+            raise ValueError(
+                f"incomplete source fusion for {target}: parts={sorted(parts)}"
+            )
+        ordered = [parts[name] for name in sorted(parts)]
+        dtypes = {item["dtype"] for item in ordered}
+        trailing_shapes = {tuple(item["shape"][1:]) for item in ordered}
+        if len(dtypes) != 1 or len(trailing_shapes) != 1:
+            raise ValueError(f"incompatible source fusion tensors for {target}")
+        canonical[target] = {
+            "dtype": ordered[0]["dtype"],
+            "shape": [sum(item["shape"][0] for item in ordered), *ordered[0]["shape"][1:]],
+            "shard": "<canonical-fusion>",
+        }
+    return canonical
 
 
 def validate_quantized_tensor(
@@ -189,7 +241,7 @@ def validate_quantized_tensor(
             f"expected=U8/{expected_packed_shape}"
         )
 
-    weight_scale_key, weight_scale_2_key, input_scale_key = sidecar_keys(key)
+    weight_scale_key, weight_scale_2_key = sidecar_keys(key)
     expected_scale_shape = (*source_shape[:-1], source_shape[-1] // BLOCK_SIZE)
     weight_scale = candidate_info[weight_scale_key]
     if (
@@ -201,13 +253,12 @@ def validate_quantized_tensor(
             f"dtype={weight_scale['dtype']} shape={weight_scale['shape']} "
             f"expected=F8_E4M3/{expected_scale_shape}"
         )
-    for scalar_key in (weight_scale_2_key, input_scale_key):
-        scalar = candidate_info[scalar_key]
-        if scalar["dtype"] != "F32" or numel(tuple(scalar["shape"])) != 1:
-            raise ValueError(
-                f"invalid NVFP4 scalar {scalar_key}: "
-                f"dtype={scalar['dtype']} shape={scalar['shape']}"
-            )
+    scalar = candidate_info[weight_scale_2_key]
+    if scalar["dtype"] != "F32" or numel(tuple(scalar["shape"])) != 1:
+        raise ValueError(
+            f"invalid NVFP4 scalar {weight_scale_2_key}: "
+            f"dtype={scalar['dtype']} shape={scalar['shape']}"
+        )
 
 
 def write_report(path: Path, report: dict) -> None:
@@ -252,13 +303,14 @@ def main(argv: list[str] | None = None) -> int:
     _source_index, source_info, _unused, source_files = read_checkpoint(source_dir)
     selected = source_routed_keys(source_info, text_config)
     selected_set = set(selected)
-    scalar_keys = {scalar for key in selected for scalar in sidecar_keys(key)[1:]}
+    canonical_info = canonical_source_info(source_info, text_config)
+    scalar_keys = {sidecar_keys(key)[1] for key in selected}
     _candidate_index, candidate_info, scalars, candidate_files = read_checkpoint(
         candidate_dir,
         scalar_keys=scalar_keys,
     )
 
-    expected_candidate_keys = set(source_info)
+    expected_candidate_keys = set(canonical_info)
     for key in selected:
         expected_candidate_keys.update(sidecar_keys(key))
     actual_candidate_keys = set(candidate_info)
@@ -271,7 +323,7 @@ def main(argv: list[str] | None = None) -> int:
             f"first_missing={missing[:8]} first_extra={extra[:8]}"
         )
 
-    for key, source_tensor in source_info.items():
+    for key, source_tensor in canonical_info.items():
         if key in selected_set:
             validate_quantized_tensor(key, source_tensor, candidate_info)
         elif (
@@ -281,13 +333,12 @@ def main(argv: list[str] | None = None) -> int:
             raise ValueError(f"preserved tensor dtype/shape changed: {key}")
 
     for key in selected:
-        _weight_scale, weight_scale_2, input_scale = sidecar_keys(key)
-        for scalar_key in (weight_scale_2, input_scale):
-            value = scalars[scalar_key]
-            if not math.isfinite(value) or value <= 0.0:
-                raise ValueError(
-                    f"non-positive or non-finite quant scalar: {scalar_key}"
-                )
+        _weight_scale, weight_scale_2 = sidecar_keys(key)
+        value = scalars[weight_scale_2]
+        if not math.isfinite(value) or value <= 0.0:
+            raise ValueError(
+                f"non-positive or non-finite quant scalar: {weight_scale_2}"
+            )
 
     first_sparse_layer = int(text_config["first_k_dense_replace"])
     num_hidden_layers = int(text_config["num_hidden_layers"])
@@ -315,15 +366,15 @@ def main(argv: list[str] | None = None) -> int:
         tensor_nbytes(value) for value in candidate_info.values()
     )
     preserved_tensor_bytes = sum(
-        tensor_nbytes(source_info[key])
-        for key in source_info
+        tensor_nbytes(canonical_info[key])
+        for key in canonical_info
         if key not in selected_set
     )
     expected_candidate_tensor_bytes = (
         preserved_tensor_bytes
         + selected_params // 2
         + selected_params // BLOCK_SIZE
-        + len(selected) * 8
+        + len(selected) * 4
     )
     if candidate_tensor_bytes != expected_candidate_tensor_bytes:
         raise ValueError(
@@ -373,7 +424,8 @@ def main(argv: list[str] | None = None) -> int:
             "block_size": BLOCK_SIZE,
             "packed_weight_dtype": "U8",
             "block_scale_dtype": "F8_E4M3",
-            "global_and_input_scale_dtype": "F32",
+            "global_scale_dtype": "F32",
+            "input_scale_storage": "dynamic_unpersisted",
             "gate_up_weight_scale_2_tied": True,
             "unexpected_quantized_tensors": 0,
         },

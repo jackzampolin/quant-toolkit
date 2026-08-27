@@ -796,7 +796,11 @@ class StreamingModelLoader:
                         tensor = f.get_tensor(raw_key)
                         target_device = target_device_for(model_key)
                         set_module_tensor_to_device(
-                            model, model_key, target_device, value=tensor
+                            model,
+                            model_key,
+                            target_device,
+                            value=tensor,
+                            dtype=tensor.dtype,
                         )
 
         # Fuse dense MiniMax M3 gate/up weights into gate_up_proj.
@@ -820,6 +824,7 @@ class StreamingModelLoader:
                 target_key,
                 target_device,
                 value=gate_up,
+                dtype=gate_up.dtype,
             )
             del gate, up, gate_up, tensors
 
@@ -839,7 +844,13 @@ class StreamingModelLoader:
             )
             fused = torch.cat([tensors[parts[part]] for part in ("q", "k", "v")], dim=0)
             target_device = target_device_for(target_key)
-            set_module_tensor_to_device(model, target_key, target_device, value=fused)
+            set_module_tensor_to_device(
+                model,
+                target_key,
+                target_device,
+                value=fused,
+                dtype=fused.dtype,
+            )
             del fused, tensors
 
         # Fuse per-expert keys into 3D parameters.
@@ -885,7 +896,11 @@ class StreamingModelLoader:
             gate_up_key = f"{prefix}.gate_up_proj"
             gate_up_device = target_device_for(gate_up_key)
             set_module_tensor_to_device(
-                model, gate_up_key, gate_up_device, value=gate_up
+                model,
+                gate_up_key,
+                gate_up_device,
+                value=gate_up,
+                dtype=gate_up.dtype,
             )
             del gate_up
 
@@ -895,7 +910,11 @@ class StreamingModelLoader:
             down_key = f"{prefix}.down_proj"
             down_device = target_device_for(down_key)
             set_module_tensor_to_device(
-                model, down_key, down_device, value=down_stacked
+                model,
+                down_key,
+                down_device,
+                value=down_stacked,
+                dtype=down_stacked.dtype,
             )
             del down_stacked
             gc.collect()
