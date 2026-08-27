@@ -76,6 +76,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--coverage-receipt", required=True, type=Path)
     parser.add_argument("--scale-install-receipt", required=True, type=Path)
     parser.add_argument("--scale-construction-receipt", required=True, type=Path)
+    parser.add_argument("--weight-patch-receipt", type=Path)
     parser.add_argument("--quant-toolkit-commit", required=True)
     parser.add_argument("--capture-tool", required=True, type=Path)
     parser.add_argument("--replay-tool", required=True, type=Path)
@@ -184,6 +185,13 @@ def main(argv: list[str] | None = None) -> int:
             "replay_tool_sha256": sha256_file(args.replay_tool),
         },
     }
+    if args.weight_patch_receipt is not None:
+        weight_patch = _load_json(args.weight_patch_receipt)
+        runtime["model"]["weight_patch_receipt"] = {
+            "path": str(args.weight_patch_receipt.resolve()),
+            "file_sha256": sha256_file(args.weight_patch_receipt),
+            "receipt_sha256": weight_patch.get("receipt_sha256"),
+        }
     runtime["runtime_sha256"] = canonical_json_sha256(runtime)
     _write_json_atomic(args.output, runtime)
     print(json.dumps({"event": "glm53_candidate_runtime_recorded", **runtime}))
