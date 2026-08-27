@@ -69,6 +69,14 @@ parser.add_argument("--save-amax", type=str, default=None,
                     help="Save calibration amax values to this safetensors file.")
 parser.add_argument("--skip-export", action="store_true",
                     help="Skip model export (amax-only calibration run).")
+parser.add_argument(
+    "--post-quant-smoke",
+    action="store_true",
+    help=(
+        "Calibrate weights without a model forward, then run exactly one configured batch "
+        "after quantization is finalized. Intended for dynamic-block NVFP4 streaming smoke tests."
+    ),
+)
 streaming_group = parser.add_mutually_exclusive_group()
 streaming_group.add_argument("--streaming", dest="streaming", action="store_true",
                              help="Force streaming loader. Default: use model config.")
@@ -1013,12 +1021,37 @@ def forward_loop(m):
     print("Calibration complete.")
 
 
+def post_quant_smoke(m):
+    if len(all_batches) != 1:
+        raise RuntimeError(
+            f"--post-quant-smoke requires exactly one configured batch, got {len(all_batches)}"
+        )
+    _validate_enabled_quantizers(m)
+    input_device = next(m.parameters()).device
+    _, batch = all_batches[0]
+    kwargs = {
+        key: value.to(input_device, non_blocking=True)
+        for key, value in batch.items()
+        if isinstance(value, torch.Tensor)
+    }
+    print("\nPost-quant smoke: 1 batch with finalized quantizers...")
+    with torch.no_grad():
+        outputs = m(**kwargs, use_cache=False)
+    del outputs, kwargs
+    gc.collect()
+    torch.cuda.empty_cache()
+    print("Post-quant smoke complete.")
+
+
 # ---------------------------------------------------------------------------
 # Quantize.
 # ---------------------------------------------------------------------------
 
 print(f"\nQuantizing with NVFP4 (model={args.model}, calib={args.calib_method})...")
-model = mtq.quantize(model, qcfg, forward_loop)
+calibration_loop = None if args.post_quant_smoke else forward_loop
+model = mtq.quantize(model, qcfg, calibration_loop)
+if args.post_quant_smoke:
+    post_quant_smoke(model)
 print(f"{'='*60}")
 
 if args.save_quantiles:
