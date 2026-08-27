@@ -284,6 +284,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--source-revision", required=True)
     parser.add_argument("--candidate-name", required=True)
     parser.add_argument("--output", required=True)
+    parser.add_argument("--bf16-reserve-layers", type=int, nargs="*", default=[])
     parser.add_argument(
         "--hash-candidate-shards",
         action="store_true",
@@ -316,18 +317,36 @@ def main(argv: list[str] | None = None) -> int:
 
     _source_index, source_info, _unused, source_files = read_checkpoint(source_dir)
     selected = source_routed_keys(source_info, text_config)
-    selected_set = set(selected)
+    reserve_layers = sorted(set(args.bf16_reserve_layers))
+    first_sparse = int(text_config["first_k_dense_replace"])
+    last_main = int(text_config["num_hidden_layers"]) - 1
+    if any(layer < first_sparse or layer > last_main for layer in reserve_layers):
+        parser.error(
+            f"BF16 reserve layers must be main routed layers {first_sparse}..{last_main}"
+        )
+    reserved = {
+        key
+        for key in selected
+        if int(ROUTED_WEIGHT_RE.fullmatch(key).group("layer")) in reserve_layers
+    }
+    quantized = [key for key in selected if key not in reserved]
+    quantized_set = set(quantized)
+    ignored = quant_config.get("ignore", [])
+    for layer in reserve_layers:
+        pattern = f"model.language_model.layers.{layer}.mlp.experts*"
+        if pattern not in ignored:
+            raise ValueError(f"BF16 reserve is absent from quant ignore list: {pattern}")
     canonical_info = canonical_source_info(source_info, text_config)
-    scalar_keys = {sidecar_keys(key)[1] for key in selected}
+    scalar_keys = {sidecar_keys(key)[1] for key in quantized}
     if requires_input_scales:
-        scalar_keys.update(input_scale_key(key) for key in selected)
+        scalar_keys.update(input_scale_key(key) for key in quantized)
     _candidate_index, candidate_info, scalars, candidate_files = read_checkpoint(
         candidate_dir,
         scalar_keys=scalar_keys,
     )
 
     expected_candidate_keys = set(canonical_info)
-    for key in selected:
+    for key in quantized:
         expected_candidate_keys.update(sidecar_keys(key))
         if requires_input_scales:
             expected_candidate_keys.add(input_scale_key(key))
@@ -342,7 +361,7 @@ def main(argv: list[str] | None = None) -> int:
         )
 
     for key, source_tensor in canonical_info.items():
-        if key in selected_set:
+        if key in quantized_set:
             validate_quantized_tensor(key, source_tensor, candidate_info)
         elif (
             candidate_info[key]["dtype"] != source_tensor["dtype"]
@@ -350,7 +369,7 @@ def main(argv: list[str] | None = None) -> int:
         ):
             raise ValueError(f"preserved tensor dtype/shape changed: {key}")
 
-    for key in selected:
+    for key in quantized:
         _weight_scale, weight_scale_2 = sidecar_keys(key)
         value = scalars[weight_scale_2]
         if not math.isfinite(value) or value <= 0.0:
@@ -375,6 +394,8 @@ def main(argv: list[str] | None = None) -> int:
     num_hidden_layers = int(text_config["num_hidden_layers"])
     num_experts = int(text_config["n_routed_experts"])
     for layer in range(first_sparse_layer, num_hidden_layers):
+        if layer in reserve_layers:
+            continue
         for expert in range(num_experts):
             prefix = f"model.language_model.layers.{layer}.mlp.experts.{expert}"
             gate = scalars[prefix + ".gate_proj.weight_scale_2"]
@@ -395,21 +416,23 @@ def main(argv: list[str] | None = None) -> int:
                     )
 
     source_tensor_bytes = sum(tensor_nbytes(value) for value in source_info.values())
-    selected_params = sum(numel(tuple(source_info[key]["shape"])) for key in selected)
+    selected_params = sum(
+        numel(tuple(source_info[key]["shape"])) for key in quantized
+    )
     candidate_tensor_bytes = sum(
         tensor_nbytes(value) for value in candidate_info.values()
     )
     preserved_tensor_bytes = sum(
         tensor_nbytes(canonical_info[key])
         for key in canonical_info
-        if key not in selected_set
+        if key not in quantized_set
     )
     expected_candidate_tensor_bytes = (
         preserved_tensor_bytes
         + selected_params // 2
         + selected_params // BLOCK_SIZE
-        + len(selected) * 4
-        + (len(selected) * 4 if requires_input_scales else 0)
+        + len(quantized) * 4
+        + (len(quantized) * 4 if requires_input_scales else 0)
     )
     if candidate_tensor_bytes != expected_candidate_tensor_bytes:
         raise ValueError(
@@ -421,7 +444,7 @@ def main(argv: list[str] | None = None) -> int:
         for item in candidate_files:
             item["sha256"] = sha256_file(candidate_dir / item["path"])
 
-    selected_key_sha256 = canonical_json_sha256(selected)
+    selected_key_sha256 = canonical_json_sha256(quantized)
     report = {
         "schema": SCHEMA,
         "source": {
@@ -448,7 +471,7 @@ def main(argv: list[str] | None = None) -> int:
             "last_main_layer": num_hidden_layers - 1,
             "protected_mtp_layer": num_hidden_layers,
             "experts_per_layer": num_experts,
-            "quantized_weight_tensors": len(selected),
+            "quantized_weight_tensors": len(quantized),
             "quantized_parameters": selected_params,
             "source_parameters": sum(
                 numel(tuple(value["shape"])) for value in source_info.values()
@@ -456,6 +479,8 @@ def main(argv: list[str] | None = None) -> int:
             "quantized_parameter_fraction": selected_params
             / sum(numel(tuple(value["shape"])) for value in source_info.values()),
             "selected_keyset_sha256": selected_key_sha256,
+            "bf16_reserve_layers": reserve_layers,
+            "bf16_reserve_weight_tensors": len(reserved),
             "block_size": BLOCK_SIZE,
             "packed_weight_dtype": "U8",
             "block_scale_dtype": "F8_E4M3",

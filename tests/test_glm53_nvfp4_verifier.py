@@ -168,6 +168,62 @@ class Glm53Nvfp4VerifierTests(unittest.TestCase):
                     ]
                 )
 
+    def test_bf16_precision_reserve_is_verified(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source, candidate = self._fixtures(root)
+            from safetensors.torch import load_file
+
+            source_tensors = load_file(source / "model-00001-of-00001.safetensors")
+            candidate_shard = candidate / "model-00001-of-00001.safetensors"
+            tensors = load_file(candidate_shard)
+            for expert in range(2):
+                for projection in ("gate_proj", "up_proj", "down_proj"):
+                    key = (
+                        "model.language_model.layers.1.mlp.experts."
+                        f"{expert}.{projection}.weight"
+                    )
+                    tensors[key] = source_tensors[key]
+                    prefix = key.removesuffix(".weight")
+                    for suffix in (".weight_scale", ".weight_scale_2", ".input_scale"):
+                        tensors.pop(prefix + suffix)
+            save_file(tensors, candidate_shard)
+            index_path = candidate / "model.safetensors.index.json"
+            index = json.loads(index_path.read_text())
+            index["weight_map"] = {key: candidate_shard.name for key in sorted(tensors)}
+            index_path.write_text(json.dumps(index) + "\n")
+            config_path = candidate / "config.json"
+            config = json.loads(config_path.read_text())
+            config["quantization_config"]["ignore"] = [
+                "model.language_model.layers.1.mlp.experts*"
+            ]
+            config_path.write_text(json.dumps(config) + "\n")
+            report_path = root / "report.json"
+
+            self.assertEqual(
+                verify_main(
+                    [
+                        "--source-model",
+                        str(source),
+                        "--candidate-model",
+                        str(candidate),
+                        "--source-revision",
+                        "b" * 40,
+                        "--candidate-name",
+                        "synthetic-reserve",
+                        "--bf16-reserve-layers",
+                        "1",
+                        "--output",
+                        str(report_path),
+                    ]
+                ),
+                0,
+            )
+            report = json.loads(report_path.read_text())
+            self.assertEqual(report["coverage"]["quantized_weight_tensors"], 0)
+            self.assertEqual(report["coverage"]["bf16_reserve_weight_tensors"], 6)
+            self.assertEqual(report["coverage"]["bf16_reserve_layers"], [1])
+
 
 if __name__ == "__main__":
     unittest.main()
