@@ -21,6 +21,7 @@ from safetensors.torch import load_file, save_file
 HIDDEN_SCHEMA = "quant-toolkit.prefill-hidden.v1"
 LOGIT_SCHEMA = "quant-toolkit.prefill-logits.v1"
 TEACHER_DATASET_SCHEMA = "quant-pipeline.glm53-bf16-teacher-logits-dataset.v1"
+TOKEN_PANEL_SCHEMA = "quant-pipeline.glm53-token-panel.v1"
 CHUNK_RE = re.compile(r"hidden\.rows-(\d+)-(\d+)\.safetensors$")
 
 
@@ -96,6 +97,26 @@ def _load_suite_token_ids(suite_dir: Path, record: dict) -> torch.Tensor:
     if expected and observed != expected:
         raise RuntimeError("suite canonical token hash mismatch")
     return token_ids.to(torch.int64)
+
+
+def _load_panel_role(panel_dir: Path, role: str) -> tuple[Path, dict, list[dict]]:
+    panel_path = panel_dir / "panel.json"
+    panel = json.loads(panel_path.read_text(encoding="utf-8"))
+    if panel.get("schema") != TOKEN_PANEL_SCHEMA:
+        raise RuntimeError(f"unexpected token-panel schema: {panel.get('schema')}")
+    source_records = [
+        record for record in panel.get("windows", []) if record.get("role") == role
+    ]
+    if not source_records:
+        raise RuntimeError(f"token panel contains no {role!r} windows")
+    records = []
+    for index, source in enumerate(source_records):
+        record = dict(source)
+        record["index"] = index
+        record["input_ids_file"] = f"arrays/{source['window_id']}.tokens.npy"
+        record["input_ids_file_sha256"] = source["token_ids_sha256"]
+        records.append(record)
+    return panel_path, panel, records
 
 
 def _validate_chunks(
@@ -197,7 +218,17 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--url", default="http://127.0.0.1:8000/v1/completions")
     parser.add_argument("--model", default="GLM-5.3-Flash-BF16")
-    parser.add_argument("--suite-manifest", type=Path, required=True)
+    source = parser.add_mutually_exclusive_group(required=True)
+    source.add_argument("--suite-manifest", type=Path)
+    source.add_argument(
+        "--panel-dir",
+        type=Path,
+        help="Sealed token-panel directory; pair with --panel-role.",
+    )
+    parser.add_argument(
+        "--panel-role",
+        choices=("fit", "conditional-fit", "selection", "confirmation", "final"),
+    )
     parser.add_argument(
         "--token-panel-dir",
         type=Path,
@@ -216,24 +247,36 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--stop-window", type=int)
     args = parser.parse_args(argv)
 
-    suite_path = args.suite_manifest.resolve()
-    suite_dir = suite_path.parent
-    suite = json.loads(suite_path.read_text(encoding="utf-8"))
-    if suite.get("schema") == LOGIT_SCHEMA:
-        _verify_manifest_seal(suite, "suite")
-    if suite.get("schema") == TEACHER_DATASET_SCHEMA:
-        if args.token_panel_dir is None:
-            parser.error("--token-panel-dir is required for a teacher dataset manifest")
-        suite_dir = args.token_panel_dir.resolve()
-        records = []
-        for source in suite.get("logit_files", []):
-            record = dict(source)
-            record["index"] = len(records)
-            record["input_ids_file"] = f"arrays/{source['window_id']}.tokens.npy"
-            record["input_ids_file_sha256"] = source["token_ids_sha256"]
-            records.append(record)
+    if args.panel_dir is not None:
+        if args.panel_role is None:
+            parser.error("--panel-role is required with --panel-dir")
+        suite_dir = args.panel_dir.resolve()
+        suite_path, suite, records = _load_panel_role(suite_dir, args.panel_role)
     else:
-        records = suite.get("windows", suite.get("contexts"))
+        if args.panel_role is not None:
+            parser.error("--panel-role is valid only with --panel-dir")
+        suite_path = args.suite_manifest.resolve()
+        suite_dir = suite_path.parent
+        suite = json.loads(suite_path.read_text(encoding="utf-8"))
+        if suite.get("schema") == LOGIT_SCHEMA:
+            _verify_manifest_seal(suite, "suite")
+        if suite.get("schema") == TEACHER_DATASET_SCHEMA:
+            if args.token_panel_dir is None:
+                parser.error(
+                    "--token-panel-dir is required for a teacher dataset manifest"
+                )
+            suite_dir = args.token_panel_dir.resolve()
+            records = []
+            for source_record in suite.get("logit_files", []):
+                record = dict(source_record)
+                record["index"] = len(records)
+                record["input_ids_file"] = (
+                    f"arrays/{source_record['window_id']}.tokens.npy"
+                )
+                record["input_ids_file_sha256"] = source_record["token_ids_sha256"]
+                records.append(record)
+        else:
+            records = suite.get("windows", suite.get("contexts"))
     if not isinstance(records, list) or not records:
         raise RuntimeError("suite manifest contains no windows")
     suite_token_sha256 = suite.get("token_sha256")
@@ -267,6 +310,7 @@ def main(argv: list[str] | None = None) -> int:
             "hidden_width": args.hidden_width,
             "storage_dtype": "bfloat16",
             "semantic_point": "after_final_rmsnorm_before_lm_head",
+            "suite_role": args.panel_role,
             "suite_manifest_file_sha256": sha256_file(suite_path),
             "token_sha256": suite_token_sha256,
             "runtime_manifest": str(runtime_path),

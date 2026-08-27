@@ -111,6 +111,22 @@ uv run --no-config --no-project --python 3.12 \
   --run-name fp8-tp4-fp8-ds-mla
 ```
 
+For calibration-panel roles, bind the capture directly to the sealed panel
+instead of synthesizing an intermediate suite manifest. For example, candidate
+ranking uses only the 64 selection windows:
+
+```bash
+uv run --no-config --no-project --python 3.12 \
+  --with torch --with 'numpy>=2.0' --with safetensors --with requests \
+  python tools/capture_glm53_hidden_suite.py \
+  --panel-dir /data/GLM-5.3-Flash-BF16-Teacher-Logits/calibration/panel-v1 \
+  --panel-role selection \
+  --capture-dir /data/kld/raw-hidden/nvfp4-selection \
+  --output-dir /data/kld/hidden/nvfp4-selection \
+  --runtime-manifest /data/kld/runtimes/nvfp4-selection.json \
+  --run-name nvfp4-selection
+```
+
 Export the shared head once from the pinned BF16 checkpoint, then reconstruct
 every candidate capture. Run the projection on a GPU only after unloading the
 serving model; the output remains float32.

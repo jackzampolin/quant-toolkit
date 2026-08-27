@@ -11,7 +11,12 @@ from safetensors.torch import load_file, save_file
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
 
-from capture_glm53_hidden_suite import _finalize_window, _validate_chunks
+from capture_glm53_hidden_suite import (
+    _finalize_window,
+    _load_panel_role,
+    _load_suite_token_ids,
+    _validate_chunks,
+)
 from export_glm53_lm_head import main as export_head_main
 from import_glm53_teacher_logits import main as import_teacher_main
 from kld_common import canonical_json_sha256, sha256_file
@@ -19,6 +24,46 @@ from replay_glm53_hidden_logits import main as replay_hidden_main
 
 
 class Glm53CaptureTests(unittest.TestCase):
+    def test_selection_role_loads_directly_from_sealed_panel(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            panel_dir = Path(temporary)
+            arrays = panel_dir / "arrays"
+            arrays.mkdir()
+            windows = []
+            for role, index in (("fit", 0), ("selection", 0), ("selection", 1)):
+                window_id = f"{role}-{index:04d}"
+                token_path = arrays / f"{window_id}.tokens.npy"
+                np.save(
+                    token_path,
+                    np.arange(index, index + 5, dtype=np.int32),
+                    allow_pickle=False,
+                )
+                windows.append(
+                    {
+                        "window_id": window_id,
+                        "role": role,
+                        "prediction_positions": 4,
+                        "token_ids_sha256": sha256_file(token_path),
+                    }
+                )
+            (panel_dir / "panel.json").write_text(
+                json.dumps(
+                    {
+                        "schema": "quant-pipeline.glm53-token-panel.v1",
+                        "sealed_corpus_sha256": "c" * 64,
+                        "windows": windows,
+                    }
+                )
+            )
+
+            _, _, records = _load_panel_role(panel_dir, "selection")
+            self.assertEqual([record["index"] for record in records], [0, 1])
+            self.assertEqual(
+                [record["window_id"] for record in records],
+                ["selection-0000", "selection-0001"],
+            )
+            self.assertEqual(_load_suite_token_ids(panel_dir, records[1]).numel(), 5)
+
     def test_teacher_import_references_external_token_arrays(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
