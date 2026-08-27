@@ -177,6 +177,10 @@ def sidecar_keys(weight_key: str) -> tuple[str, str]:
     )
 
 
+def input_scale_key(weight_key: str) -> str:
+    return weight_key.removesuffix(".weight") + ".input_scale"
+
+
 def canonical_source_info(source_info: dict[str, dict], text_config: dict) -> dict[str, dict]:
     """Map raw checkpoint tensors to the pinned Transformers model keyspace."""
     protected_prefix = (
@@ -300,11 +304,23 @@ def main(argv: list[str] | None = None) -> int:
     if "Glm5NextForConditionalGeneration" not in architectures:
         raise ValueError("source checkpoint is not GLM-5.3-Flash")
 
+    quant_config = candidate_config.get("quantization_config")
+    if not isinstance(quant_config, dict):
+        raise TypeError("candidate config has no quantization_config object")
+    quant_algo = str(quant_config.get("quant_algo", "")).upper()
+    if quant_algo not in {"NVFP4", "W4A16_NVFP4"}:
+        raise ValueError(
+            "candidate quantization_config must declare NVFP4 or W4A16_NVFP4"
+        )
+    requires_input_scales = quant_algo == "NVFP4"
+
     _source_index, source_info, _unused, source_files = read_checkpoint(source_dir)
     selected = source_routed_keys(source_info, text_config)
     selected_set = set(selected)
     canonical_info = canonical_source_info(source_info, text_config)
     scalar_keys = {sidecar_keys(key)[1] for key in selected}
+    if requires_input_scales:
+        scalar_keys.update(input_scale_key(key) for key in selected)
     _candidate_index, candidate_info, scalars, candidate_files = read_checkpoint(
         candidate_dir,
         scalar_keys=scalar_keys,
@@ -313,6 +329,8 @@ def main(argv: list[str] | None = None) -> int:
     expected_candidate_keys = set(canonical_info)
     for key in selected:
         expected_candidate_keys.update(sidecar_keys(key))
+        if requires_input_scales:
+            expected_candidate_keys.add(input_scale_key(key))
     actual_candidate_keys = set(candidate_info)
     if actual_candidate_keys != expected_candidate_keys:
         missing = sorted(expected_candidate_keys - actual_candidate_keys)
@@ -339,6 +357,19 @@ def main(argv: list[str] | None = None) -> int:
             raise ValueError(
                 f"non-positive or non-finite quant scalar: {weight_scale_2}"
             )
+        activation_scale = input_scale_key(key)
+        if requires_input_scales:
+            info = candidate_info[activation_scale]
+            if info["dtype"] != "F32" or numel(tuple(info["shape"])) != 1:
+                raise ValueError(
+                    f"invalid NVFP4 activation scalar {activation_scale}: "
+                    f"dtype={info['dtype']} shape={info['shape']}"
+                )
+            activation_value = scalars[activation_scale]
+            if not math.isfinite(activation_value) or activation_value <= 0.0:
+                raise ValueError(
+                    f"non-positive or non-finite activation scalar: {activation_scale}"
+                )
 
     first_sparse_layer = int(text_config["first_k_dense_replace"])
     num_hidden_layers = int(text_config["num_hidden_layers"])
@@ -353,12 +384,15 @@ def main(argv: list[str] | None = None) -> int:
                     "gate/up weight_scale_2 is not tied: "
                     f"layer={layer} expert={expert} gate={gate} up={up}"
                 )
-
-    quant_config = candidate_config.get("quantization_config")
-    if not isinstance(quant_config, dict):
-        raise TypeError("candidate config has no quantization_config object")
-    if "NVFP4" not in json.dumps(quant_config, sort_keys=True).upper():
-        raise ValueError("candidate quantization_config does not declare NVFP4")
+            if requires_input_scales:
+                gate_input = scalars[input_scale_key(prefix + ".gate_proj.weight")]
+                up_input = scalars[input_scale_key(prefix + ".up_proj.weight")]
+                if gate_input != up_input:
+                    raise ValueError(
+                        "gate/up input_scale is not tied: "
+                        f"layer={layer} expert={expert} "
+                        f"gate={gate_input} up={up_input}"
+                    )
 
     source_tensor_bytes = sum(tensor_nbytes(value) for value in source_info.values())
     selected_params = sum(numel(tuple(source_info[key]["shape"])) for key in selected)
@@ -375,6 +409,7 @@ def main(argv: list[str] | None = None) -> int:
         + selected_params // 2
         + selected_params // BLOCK_SIZE
         + len(selected) * 4
+        + (len(selected) * 4 if requires_input_scales else 0)
     )
     if candidate_tensor_bytes != expected_candidate_tensor_bytes:
         raise ValueError(
@@ -425,8 +460,18 @@ def main(argv: list[str] | None = None) -> int:
             "packed_weight_dtype": "U8",
             "block_scale_dtype": "F8_E4M3",
             "global_scale_dtype": "F32",
-            "input_scale_storage": "dynamic_unpersisted",
+            "activation_mode": (
+                "w4a4_dynamic_group_static_global"
+                if requires_input_scales
+                else "w4a16_bf16"
+            ),
+            "input_scale_storage": (
+                "static_f32_per_expert_projection"
+                if requires_input_scales
+                else "absent"
+            ),
             "gate_up_weight_scale_2_tied": True,
+            "gate_up_input_scale_tied": requires_input_scales,
             "unexpected_quantized_tensors": 0,
         },
     }

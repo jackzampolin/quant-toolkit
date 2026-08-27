@@ -20,6 +20,7 @@ COPY_NAMES = (
     "special_tokens_map.json",
     "tokenizer.model",
     "added_tokens.json",
+    "processor_config.json",
     "preprocessor_config.json",
     "video_preprocessor_config.json",
     "merges.txt",

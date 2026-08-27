@@ -70,6 +70,7 @@ class Glm53Nvfp4VerifierTests(unittest.TestCase):
                 (16, 1), dtype=torch.float8_e4m3fn
             )
             candidate_tensors[prefix + ".weight_scale_2"] = torch.tensor(0.25)
+            candidate_tensors[prefix + ".input_scale"] = torch.tensor(0.125)
         candidate_config = dict(config)
         candidate_config["quantization_config"] = {"quant_algo": "NVFP4"}
         self._write_checkpoint(candidate, candidate_tensors, candidate_config)
@@ -101,6 +102,11 @@ class Glm53Nvfp4VerifierTests(unittest.TestCase):
             self.assertEqual(report["coverage"]["quantized_weight_tensors"], 6)
             self.assertEqual(report["coverage"]["quantized_parameters"], 1536)
             self.assertTrue(report["coverage"]["gate_up_weight_scale_2_tied"])
+            self.assertTrue(report["coverage"]["gate_up_input_scale_tied"])
+            self.assertEqual(
+                report["coverage"]["input_scale_storage"],
+                "static_f32_per_expert_projection",
+            )
             self.assertEqual(len(report["report_sha256"]), 64)
 
     def test_untied_gate_up_scale_fails_closed(self):
@@ -115,6 +121,38 @@ class Glm53Nvfp4VerifierTests(unittest.TestCase):
             tensors[key] = torch.tensor(0.5)
             save_file(tensors, shard)
             with self.assertRaisesRegex(ValueError, "not tied"):
+                verify_main(
+                    [
+                        "--source-model",
+                        str(source),
+                        "--candidate-model",
+                        str(candidate),
+                        "--source-revision",
+                        "b" * 40,
+                        "--candidate-name",
+                        "synthetic",
+                        "--output",
+                        str(root / "report.json"),
+                    ]
+                )
+
+    def test_missing_w4a4_input_scale_fails_closed(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source, candidate = self._fixtures(root)
+            shard = candidate / "model-00001-of-00001.safetensors"
+            from safetensors.torch import load_file
+
+            tensors = load_file(shard)
+            tensors.pop(
+                "model.language_model.layers.1.mlp.experts.0.down_proj.input_scale"
+            )
+            save_file(tensors, shard)
+            index_path = candidate / "model.safetensors.index.json"
+            index = json.loads(index_path.read_text())
+            index["weight_map"] = {key: shard.name for key in sorted(tensors)}
+            index_path.write_text(json.dumps(index) + "\n")
+            with self.assertRaisesRegex(ValueError, "keyset"):
                 verify_main(
                     [
                         "--source-model",

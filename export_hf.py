@@ -581,7 +581,8 @@ def _save_model_metadata(
     copy_patterns = [
         "tokenizer.json", "tokenizer_config.json", "chat_template.jinja",
         "special_tokens_map.json", "tokenizer.model", "added_tokens.json",
-        "preprocessor_config.json", "video_preprocessor_config.json",
+        "processor_config.json", "preprocessor_config.json",
+        "video_preprocessor_config.json",
         "merges.txt", "vocab.json",
     ]
     if preserve_remote_code:
