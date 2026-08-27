@@ -65,6 +65,7 @@ def _rewrite_precision_reserve(
         }
         for shard in sorted(changed_by_shard):
             path = candidate / shard
+            original_mode = path.stat().st_mode & 0o777
             temporary = path.with_name(f".{path.name}.incomplete")
             shard_changes = changed_by_shard[shard]
             shard_weights = shard_changes & weights
@@ -78,6 +79,7 @@ def _rewrite_precision_reserve(
             for key in shard_weights:
                 tensors[key] = source_handles[source_map[key]].get_tensor(key)
             save_file(tensors, temporary)
+            os.chmod(temporary, original_mode)
             descriptor = os.open(temporary, os.O_RDONLY)
             try:
                 os.fsync(descriptor)
