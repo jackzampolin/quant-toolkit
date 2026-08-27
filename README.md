@@ -55,6 +55,22 @@ uv run --no-config --no-project --python 3.12 \
   --output /data/kld/runtimes/glm53-nvfp4-codec-audit.json
 ```
 
+Once codec parity passes, audit the first exact reconstruction lever on a real
+BF16 expert. This searches nearby representable FP8 E4M3 block scales while
+keeping the packed E2M1 runtime format and the tied gate/up secondary scale.
+The unweighted result is only a reconstruction baseline; routed activation
+moments and held-out end-to-end KLD decide whether a candidate is accepted.
+
+```bash
+uv run --no-config --no-project --python 3.12 \
+  --with torch --with safetensors \
+  python tools/audit_glm53_nvfp4_scale_search.py \
+  --source-model /data/models/GLM-5.3-Flash-BF16-b1967181 \
+  --layer 3 --expert 0 --device cpu \
+  --artifact /data/kld/runtimes/glm53-scale-search-l3-e0.safetensors \
+  --output /data/kld/runtimes/glm53-scale-search-l3-e0.json
+```
+
 ## Dense-prefill KLD
 
 The campaign workflow is capture once, compare many. Every weight/topology/KV
