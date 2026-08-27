@@ -193,6 +193,50 @@ class _QuantGlm5NextTextMoE(_QuantSparseMoe):
     def forward(self, hidden_states):
         return super(_QuantSparseMoe, self).forward(hidden_states)
 
+    def layer_sync_moe_local_experts_amax(self, sync_weight_amax=False):
+        """Adapt ModelOpt's sequential-expert sync to GLM's fused wrapper.
+
+        ``_QuantFusedExperts`` expands each projection into a separate
+        ``ModuleList`` but remains a single module, whereas ModelOpt expects
+        ``self.experts`` to be iterable.  Present one lightweight projection
+        view per expert without registering duplicate module parents.
+        """
+        from modelopt.torch.quantization.utils.core_utils import (
+            sync_moe_expert_amax,
+        )
+
+        class _ExpertView:
+            def __init__(self, experts, index):
+                self.experts = experts
+                self.index = index
+
+            def named_modules(self):
+                for projection in ("gate_proj", "up_proj", "down_proj"):
+                    linear = getattr(self.experts, projection)[self.index]
+                    for name, module in linear.named_modules():
+                        yield (
+                            projection if not name else f"{projection}.{name}",
+                            module,
+                        )
+
+            def state_dict(self):
+                state = {}
+                for projection in ("gate_proj", "up_proj", "down_proj"):
+                    linear = getattr(self.experts, projection)[self.index]
+                    state.update(
+                        {
+                            f"{projection}.{name}": value
+                            for name, value in linear.state_dict().items()
+                        }
+                    )
+                return state
+
+        views = [
+            _ExpertView(self.experts, index)
+            for index in range(self.experts.num_experts)
+        ]
+        sync_moe_expert_amax(views, sync_weight_amax=sync_weight_amax)
+
 
 def register_glm5_next_moe_for_quantization():
     """Register upstream Transformers GLM-5.3 MoE classes with ModelOpt."""
