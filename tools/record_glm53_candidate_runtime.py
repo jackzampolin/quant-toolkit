@@ -4,16 +4,28 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import subprocess
 from datetime import UTC, datetime
 from pathlib import Path
 
-from kld_common import canonical_json_sha256, sha256_file
-
-
 SCHEMA = "quant-toolkit.glm53-kld-runtime.v2"
+
+
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        while chunk := handle.read(16 * 1024 * 1024):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def canonical_json_sha256(value: object) -> str:
+    return hashlib.sha256(
+        json.dumps(value, separators=(",", ":"), sort_keys=True).encode()
+    ).hexdigest()
 
 
 def _load_json(path: Path) -> dict:
