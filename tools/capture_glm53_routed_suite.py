@@ -28,13 +28,22 @@ EXPECTED_KEYS = {
 }
 
 
+def _fsync_directory(path: Path) -> None:
+    directory_fd = os.open(path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    try:
+        os.fsync(directory_fd)
+    finally:
+        os.close(directory_fd)
+
+
 def _write_json_atomic(path: Path, payload: dict) -> None:
     temporary = path.with_suffix(path.suffix + ".tmp")
-    temporary.write_text(
-        json.dumps(payload, indent=2, sort_keys=True) + "\n",
-        encoding="utf-8",
-    )
+    with temporary.open("w", encoding="utf-8") as output:
+        output.write(json.dumps(payload, indent=2, sort_keys=True) + "\n")
+        output.flush()
+        os.fsync(output.fileno())
     os.replace(temporary, path)
+    _fsync_directory(path.parent)
 
 
 def _seal_manifest(path: Path, manifest: dict) -> None:
@@ -157,7 +166,16 @@ def _finalize_pass(
     if destination.exists():
         raise RuntimeError(f"refusing to overwrite finalized routed evidence: {destination}")
     destination.parent.mkdir(parents=True, exist_ok=True)
+    for layer_id in EXPECTED_ROUTED_LAYERS:
+        layer_path = raw_pass / f"layer-{layer_id:04d}.safetensors"
+        layer_fd = os.open(layer_path, os.O_RDONLY)
+        try:
+            os.fsync(layer_fd)
+        finally:
+            os.close(layer_fd)
+    _fsync_directory(raw_pass)
     os.replace(raw_pass, destination)
+    _fsync_directory(destination.parent)
     try:
         return [
             _validate_layer(
@@ -174,6 +192,7 @@ def _finalize_pass(
         failed = destination.with_name(destination.name + ".failed-validation")
         if not failed.exists():
             os.replace(destination, failed)
+            _fsync_directory(failed.parent)
         raise
 
 
